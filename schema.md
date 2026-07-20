@@ -7,4 +7,4 @@
 -- shops: one shop per shopkeeper
 -- transactions.customer_user_id links a tx to a customer user
 
--- See server/src/db.ts ensureSchema() for the live CREATE TABLE statements.
+-- See server/src/db.js ensureSchema() for the live CREATE TABLE statements.
