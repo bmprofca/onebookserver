@@ -1,12 +1,12 @@
 import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
-import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './auth.js';
-import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, initStore, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, uniqueTxCreatedAt, saveAuth, saveState, } from './store.js';
-import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './onechatting.js';
-import { isSmsOtpConfigured, sendSmsOtp } from './fast2sms.js';
-import { billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isDateOnly, localDateString, materializeRecurringBillings, postNextRecurringBill, RECURRING_INTERVALS, } from './recurring.js';
+import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
+import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, initStore, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, uniqueTxCreatedAt, saveAuth, saveState, } from './src/store.js';
+import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
+import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
+import { billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isDateOnly, localDateString, materializeRecurringBillings, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const OTP_TTL_MS = 1000 * 60 * 5;
