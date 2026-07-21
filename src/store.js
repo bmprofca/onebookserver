@@ -9,6 +9,13 @@ const shopFile = join(dataDir, 'shop.json');
 const authFile = join(dataDir, 'auth.json');
 export const DEFAULT_CASH_ACCOUNT_ID = 'cash-default';
 export const DEFAULT_ACTION_CONFIRM_CODE = '123456';
+
+/** True when this is the system Cash ledger id (legacy or shop-scoped). */
+export function isSystemCashAccountId(id) {
+    if (!id)
+        return false;
+    return id === DEFAULT_CASH_ACCOUNT_ID || String(id).endsWith(':cash');
+}
 /** Per-shop edit/delete confirmation codes (not sent to clients). */
 const shopActionCodes = new Map();
 export function getActionConfirmCode(appId) {
@@ -90,9 +97,10 @@ export function calcAccountBalance(account, transactions) {
         txCount: txs.length,
     };
 }
-export function defaultCashAccount(openingBalance = 0, createdAt) {
+export function defaultCashAccount(openingBalance = 0, createdAt, appId) {
+    const id = appId ? `${appId}:cash` : DEFAULT_CASH_ACCOUNT_ID;
     return {
-        id: DEFAULT_CASH_ACCOUNT_ID,
+        id,
         name: 'Cash',
         kind: 'cash',
         bankName: null,
@@ -121,16 +129,25 @@ export function ensureCashAccounts(state) {
     if (!Array.isArray(state.cashAccounts))
         state.cashAccounts = [];
     state.cashAccounts = state.cashAccounts.map(normalizeCashAccount);
-    let system = state.cashAccounts.find((a) => a.isSystem || a.id === DEFAULT_CASH_ACCOUNT_ID);
+    let system = state.cashAccounts.find((a) => a.isSystem || isSystemCashAccountId(a.id));
     if (!system) {
-        system = defaultCashAccount(state.openingBalance ?? 0, state.createdAt);
+        system = defaultCashAccount(state.openingBalance ?? 0, state.createdAt, state.appId);
         state.cashAccounts.unshift(system);
     }
     else {
         system.isSystem = true;
         system.kind = 'cash';
+        // Namespace legacy global id so multiple shops can persist safely
+        if (state.appId && system.id === DEFAULT_CASH_ACCOUNT_ID) {
+            const nextId = `${state.appId}:cash`;
+            for (const tx of state.transactions ?? []) {
+                if (tx.cashAccountId === DEFAULT_CASH_ACCOUNT_ID)
+                    tx.cashAccountId = nextId;
+            }
+            system.id = nextId;
+        }
         if (!system.id)
-            system.id = DEFAULT_CASH_ACCOUNT_ID;
+            system.id = state.appId ? `${state.appId}:cash` : DEFAULT_CASH_ACCOUNT_ID;
         // Shop opening balance is the Cash account opening balance.
         if (typeof state.openingBalance === 'number' && !Number.isNaN(state.openingBalance)) {
             system.openingBalance = state.openingBalance;
@@ -172,14 +189,15 @@ export function ensureCashAccounts(state) {
 }
 export function emptyState() {
     const createdAt = new Date().toISOString();
+    const appId = generateAppId();
     const state = {
-        appId: generateAppId(),
+        appId,
         shopName: '',
         shopAddress: '',
         openingBalance: 0,
         users: [],
         activeUserId: null,
-        cashAccounts: [defaultCashAccount(0, createdAt)],
+        cashAccounts: [defaultCashAccount(0, createdAt, appId)],
         transactions: [],
         recurringBillings: [],
         services: [],
@@ -476,7 +494,7 @@ async function persistShop(state, ownerUserId) {
                     a.id,
                     appId,
                     a.name || 'Cash',
-                    a.isSystem || a.id === DEFAULT_CASH_ACCOUNT_ID ? 1 : 0,
+                    a.isSystem || isSystemCashAccountId(a.id) ? 1 : 0,
                     a.openingBalance,
                     toMysqlDate(a.createdAt),
                 ]);
@@ -510,7 +528,7 @@ async function persistShop(state, ownerUserId) {
                     (t.category === 'sales' && !t.cashAccountId) ||
                     (t.category === 'purchase' && !t.cashAccountId)
                     ? null
-                    : (t.cashAccountId ?? DEFAULT_CASH_ACCOUNT_ID),
+                    : (t.cashAccountId ?? (appId ? `${appId}:cash` : DEFAULT_CASH_ACCOUNT_ID)),
                 t.category === 'adjustment' ||
                     (t.category === 'sales' && !t.cashAccountId) ||
                     (t.category === 'purchase' && !t.cashAccountId)
@@ -919,6 +937,7 @@ async function migrateFromDocumentsIfNeeded() {
 export async function initStore() {
     await initDb();
     await migrateFromDocumentsIfNeeded();
+    await repairShopAccountLinks();
     authCache = await loadAuthFromDb();
     const [shopRows] = await getPool().query('SELECT app_id FROM shops');
     shopCaches.clear();
@@ -926,8 +945,9 @@ export async function initStore() {
     for (const row of shopRows) {
         const appId = String(row.app_id);
         const state = await loadShopFromDb(appId);
-        if (state)
-            shopCaches.set(appId, state);
+        if (state) {
+            shopCaches.set(appId, ensureCashAccounts(state));
+        }
     }
     // If no shops yet but we have incomplete setup from docs — handled by migrate
     if (shopCaches.size === 0) {
@@ -939,6 +959,46 @@ export async function initStore() {
     }
     console.log(`[MySQL] Loaded ${authCache.accounts.length} users, ${shopCaches.size} shop(s)`);
 }
+
+/**
+ * Repair orphan shopkeepers and owners with null shop_app_id so they never
+ * inherit another shop via legacy fallbacks.
+ */
+async function repairShopAccountLinks() {
+    const p = getPool();
+    // Owners listed on shops but missing shop_app_id
+    try {
+        const [r1] = await p.query(`
+      UPDATE users u
+      INNER JOIN shops s ON s.owner_user_id = u.id
+      SET u.shop_app_id = s.app_id
+      WHERE u.role = 'shopkeeper'
+        AND (u.shop_app_id IS NULL OR u.shop_app_id = '')
+    `);
+        if (r1.affectedRows)
+            console.log(`[MySQL] Linked ${r1.affectedRows} shopkeeper(s) to owned shop`);
+    }
+    catch (err) {
+        console.warn('[MySQL] owner shop_app_id repair skipped:', err instanceof Error ? err.message : err);
+    }
+    // Clear shop_app_id that points at a shop that does not exist (force re-setup)
+    try {
+        const [r2] = await p.query(`
+      UPDATE users u
+      LEFT JOIN shops s ON s.app_id = u.shop_app_id
+      SET u.shop_app_id = NULL
+      WHERE u.role = 'shopkeeper'
+        AND u.shop_app_id IS NOT NULL
+        AND u.shop_app_id <> ''
+        AND s.app_id IS NULL
+    `);
+        if (r2.affectedRows)
+            console.log(`[MySQL] Cleared ${r2.affectedRows} orphan shop_app_id link(s)`);
+    }
+    catch (err) {
+        console.warn('[MySQL] orphan shop_app_id repair skipped:', err instanceof Error ? err.message : err);
+    }
+}
 export function loadAuth() {
     if (!authCache)
         throw new Error('Store not initialized');
@@ -949,27 +1009,91 @@ export function saveAuth(auth) {
     authCache = next;
     enqueuePersist(() => persistAuth(next));
 }
+
+/** Load a shop by app id only (no account fallback). */
+export function getShopByAppId(appId) {
+    if (!appId)
+        return null;
+    const cached = shopCaches.get(appId);
+    if (!cached)
+        return null;
+    return normalizeState(structuredClone(cached));
+}
+
+/** Persist shop state without requiring a logged-in account. */
+export function saveShopByAppId(state) {
+    const next = normalizeState(structuredClone(state));
+    shopCaches.set(next.appId, next);
+    const ownerId = next.users.find((u) => u.role === 'shopkeeper')?.id ?? null;
+    if (authCache) {
+        for (const u of next.users) {
+            const idx = authCache.accounts.findIndex((a) => a.id === u.id);
+            if (idx >= 0) {
+                const existing = authCache.accounts[idx];
+                if (existing.shopAppId && existing.shopAppId !== next.appId && existing.role === 'shopkeeper') {
+                    continue;
+                }
+                authCache.accounts[idx] = {
+                    ...existing,
+                    name: u.name,
+                    phone: u.phone,
+                    role: u.role,
+                    shopAppId: next.appId,
+                };
+            }
+        }
+    }
+    enqueuePersist(async () => {
+        await persistShop(next, ownerId);
+        if (authCache)
+            await persistAuth(authCache);
+        await setDocument(SHOP_DOC, next);
+        if (authCache)
+            await setDocument(AUTH_DOC, authCache);
+    });
+}
+
 /**
- * Load shop state for the logged-in account.
- * - Shopkeeper: their shop (by shopAppId or draft)
- * - Customer: the shop they belong to
- * - Fallback: first shop / empty (legacy single-shop)
+ * Load shop state for the logged-in account only.
+ * Never falls back to another shopkeeper's books.
  */
 export function loadState(account) {
-    if (account?.shopAppId) {
+    if (!account)
+        return emptyState();
+    if (account.shopAppId) {
         const cached = shopCaches.get(account.shopAppId);
-        if (cached)
-            return normalizeState(structuredClone(cached));
+        if (cached) {
+            const scoped = normalizeState(structuredClone(cached));
+            if (account.role === 'shopkeeper') {
+                const isMember = scoped.users.some((u) => u.id === account.id);
+                if (!isMember && scoped.setupComplete) {
+                    // Orphan link: do not expose another shop's completed books
+                    const draft = draftByOwner.get(account.id);
+                    if (draft)
+                        return normalizeState(structuredClone(draft));
+                    const isolated = emptyState();
+                    isolated.appId = account.shopAppId;
+                    return isolated;
+                }
+            }
+            return scoped;
+        }
+        // shopAppId points at a missing shop — use own draft only, never another shop
+        if (account.role === 'shopkeeper' && account.id) {
+            const draft = draftByOwner.get(account.id);
+            if (draft)
+                return normalizeState(structuredClone(draft));
+            const isolated = emptyState();
+            isolated.appId = account.shopAppId;
+            return isolated;
+        }
+        return emptyState();
     }
-    if (account?.role === 'shopkeeper' && account.id) {
+    if (account.role === 'shopkeeper' && account.id) {
         const draft = draftByOwner.get(account.id);
         if (draft)
             return normalizeState(structuredClone(draft));
     }
-    // Legacy / first shop
-    const first = shopCaches.values().next().value;
-    if (first)
-        return normalizeState(structuredClone(first));
     return emptyState();
 }
 export function saveState(state, account) {
@@ -978,13 +1102,18 @@ export function saveState(state, account) {
     if (!next.setupComplete && account?.role === 'shopkeeper') {
         draftByOwner.set(account.id, next);
     }
-    // Keep all auth accounts for this shop linked
+    // Keep auth accounts for this shop linked — match by user id only (never by phone)
     if (authCache) {
         for (const u of next.users) {
-            const idx = authCache.accounts.findIndex((a) => a.id === u.id || a.phone === u.phone);
+            const idx = authCache.accounts.findIndex((a) => a.id === u.id);
             if (idx >= 0) {
+                const existing = authCache.accounts[idx];
+                // Do not steal another shop's account by phone collision
+                if (existing.shopAppId && existing.shopAppId !== next.appId && existing.role === 'shopkeeper') {
+                    continue;
+                }
                 authCache.accounts[idx] = {
-                    ...authCache.accounts[idx],
+                    ...existing,
                     name: u.name,
                     phone: u.phone,
                     role: u.role,

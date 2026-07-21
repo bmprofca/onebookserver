@@ -140,7 +140,7 @@ async function ensureSchema() {
   `);
     await p.query(`
     CREATE TABLE IF NOT EXISTS cash_accounts (
-      id VARCHAR(64) NOT NULL PRIMARY KEY,
+      id VARCHAR(64) NOT NULL,
       shop_app_id VARCHAR(32) NOT NULL,
       name VARCHAR(120) NOT NULL,
       kind ENUM('cash','bank') NOT NULL DEFAULT 'cash',
@@ -150,9 +150,29 @@ async function ensureSchema() {
       is_system TINYINT(1) NOT NULL DEFAULT 0,
       opening_balance DECIMAL(14,2) NOT NULL DEFAULT 0,
       created_at DATETIME(3) NOT NULL,
+      PRIMARY KEY (shop_app_id, id),
       KEY idx_cash_shop (shop_app_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+    // Legacy installs used global PRIMARY KEY (id) — break multi-shop Cash defaults
+    try {
+        const [pkRows] = await p.query(`
+      SELECT COLUMN_NAME
+      FROM information_schema.KEY_COLUMN_USAGE
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'cash_accounts'
+        AND CONSTRAINT_NAME = 'PRIMARY'
+      ORDER BY ORDINAL_POSITION
+    `);
+        const pkCols = pkRows.map((r) => String(r.COLUMN_NAME));
+        if (pkCols.length === 1 && pkCols[0] === 'id') {
+            await p.query('ALTER TABLE cash_accounts DROP PRIMARY KEY, ADD PRIMARY KEY (shop_app_id, id)');
+            console.log('[MySQL] Migrated cash_accounts PK → (shop_app_id, id)');
+        }
+    }
+    catch (err) {
+        console.warn('[MySQL] cash_accounts PK migrate skipped:', err instanceof Error ? err.message : err);
+    }
     await p.query(`
     CREATE TABLE IF NOT EXISTS bank_accounts (
       id VARCHAR(64) NOT NULL PRIMARY KEY,

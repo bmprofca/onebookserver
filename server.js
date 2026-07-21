@@ -1,9 +1,11 @@
 import 'dotenv/config';
 import cors from 'cors';
 import express from 'express';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, initStore, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, uniqueTxCreatedAt, saveAuth, saveState, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, } from './src/store.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
 import { billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isDateOnly, localDateString, materializeRecurringBillings, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
@@ -136,7 +138,46 @@ async function issueOtp(phone, purpose) {
 ensureUploadsDir();
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
-app.use('/uploads', express.static(UPLOADS_DIR));
+app.use(
+    '/uploads',
+    express.static(UPLOADS_DIR, { fallthrough: true }),
+    async (req, res, next) => {
+        const fallbackBase = (process.env.UPLOADS_FALLBACK_BASE || '').replace(/\/$/, '');
+        if (!fallbackBase) {
+            res.status(404).end();
+            return;
+        }
+        const file = path.basename(req.path || '');
+        if (!file || file.includes('..')) {
+            res.status(404).end();
+            return;
+        }
+        const remoteUrl = `${fallbackBase}/uploads/${encodeURIComponent(file)}`;
+        try {
+            const remote = await fetch(remoteUrl);
+            if (!remote.ok) {
+                res.status(404).end();
+                return;
+            }
+            const contentType = remote.headers.get('content-type') || 'application/octet-stream';
+            const buffer = Buffer.from(await remote.arrayBuffer());
+            const localPath = path.join(UPLOADS_DIR, file);
+            try {
+                fs.writeFileSync(localPath, buffer);
+            }
+            catch {
+                // cache is best-effort
+            }
+            res.setHeader('Content-Type', contentType);
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.send(buffer);
+        }
+        catch (err) {
+            console.error('[uploads] fallback failed', remoteUrl, err);
+            next();
+        }
+    },
+);
 /** Require shops.action_confirm_code for edit/delete (dev default 123456). */
 function requireActionConfirmCode(req, res, state) {
     const code = String(req.body?.confirmCode ?? '').replace(/\D/g, '').slice(0, 6);
@@ -150,6 +191,340 @@ function requireActionConfirmCode(req, res, state) {
 app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
 });
+
+function publicJoinBaseUrl(req) {
+    const configured = (process.env.PUBLIC_JOIN_BASE || process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
+    if (configured)
+        return configured;
+    const proto = String(req.headers['x-forwarded-proto'] || req.protocol || 'https');
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').trim();
+    if (host)
+        return `${proto}://${host}`;
+    return 'https://onebookserver.onesaasbackend.com';
+}
+
+/** Shopkeeper: get this shop’s unique customer-join QR URL. */
+app.get('/api/shop/join-qr', requireShopkeeper, (req, res) => {
+    const state = loadState(req.account);
+    if (!state.setupComplete || !state.appId) {
+        res.status(400).json({ error: 'Complete shop setup first' });
+        return;
+    }
+    if (req.account.shopAppId && req.account.shopAppId !== state.appId) {
+        res.status(403).json({ error: 'Shop mismatch — sign in again' });
+        return;
+    }
+    const joinUrl = `${publicJoinBaseUrl(req)}/join/${encodeURIComponent(state.appId)}`;
+    res.json({
+        appId: state.appId,
+        shopName: state.shopName,
+        joinUrl,
+    });
+});
+
+/** Public: shop info for join page. */
+app.get('/api/public/join/:appId', (req, res) => {
+    const appId = String(req.params.appId || '').trim();
+    const shop = getShopByAppId(appId);
+    if (!shop || !shop.setupComplete) {
+        res.status(404).json({ error: 'Shop not found' });
+        return;
+    }
+    res.json({
+        appId: shop.appId,
+        shopName: shop.shopName,
+    });
+});
+
+/** Public: customer self-registers into a specific shop via QR. */
+app.post('/api/public/join/:appId', async (req, res) => {
+    const appId = String(req.params.appId || '').trim();
+    const shop = getShopByAppId(appId);
+    if (!shop || !shop.setupComplete) {
+        res.status(404).json({ error: 'Shop not found' });
+        return;
+    }
+    const name = String(req.body?.name ?? '').trim();
+    const phone = normalizePhone(String(req.body?.phone ?? ''));
+    if (!name) {
+        res.status(400).json({ error: 'Name is required' });
+        return;
+    }
+    if (!isValidPhone(phone)) {
+        res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
+        return;
+    }
+    if (shop.users.some((u) => normalizePhone(u.phone) === phone)) {
+        res.status(409).json({ error: 'This mobile is already linked to this shop' });
+        return;
+    }
+    const auth = loadAuth();
+    if (auth.accounts.some((a) => normalizePhone(a.phone) === phone)) {
+        res.status(409).json({
+            error: 'This mobile is already registered. Login with OTP instead.',
+        });
+        return;
+    }
+    try {
+        if (await phoneExistsInDatabase(phone)) {
+            res.status(409).json({ error: 'This mobile already exists in the database' });
+            return;
+        }
+    }
+    catch (err) {
+        console.error('[join] phone lookup failed', err);
+        res.status(500).json({ error: 'Could not validate mobile number' });
+        return;
+    }
+    const userId = newId();
+    const createdAt = new Date().toISOString();
+    const user = {
+        id: userId,
+        name,
+        phone,
+        email: null,
+        role: 'customer',
+        createdAt,
+    };
+    shop.users.push(user);
+    try {
+        saveShopByAppId(shop);
+        auth.accounts.push({
+            id: userId,
+            name,
+            phone,
+            email: null,
+            role: 'customer',
+            shopAppId: shop.appId,
+            phoneVerified: false,
+            createdAt,
+        });
+        saveAuth(auth);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
+            res.status(409).json({ error: 'This mobile already exists in the database' });
+            return;
+        }
+        console.error('[join] create failed', err);
+        res.status(500).json({ error: 'Could not save customer' });
+        return;
+    }
+    res.status(201).json({
+        ok: true,
+        shopName: shop.shopName,
+        customer: { id: userId, name, phone },
+        message: `Connected to ${shop.shopName}. You can login with OTP using ${phone}.`,
+    });
+});
+
+/** Public HTML join page (works when customers scan QR from phone camera). */
+app.get('/join/:appId', (req, res) => {
+    const appId = String(req.params.appId || '').trim();
+    const shop = getShopByAppId(appId);
+    const shopName = shop?.setupComplete ? shop.shopName : '';
+    const safeAppId = appId.replace(/[^a-zA-Z0-9_-]/g, '');
+    const title = shopName ? `Join ${shopName}` : 'Join shop';
+    res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#1e40af" />
+  <title>${title.replace(/[<>&]/g, '')}</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 0; min-height: 100dvh; background: linear-gradient(180deg,#eff6ff,#f8fafc); color:#0f172a; }
+    main { max-width: 420px; margin: 0 auto; padding: 1.5rem 1.1rem 2rem; }
+    .card { background:#fff; border:1px solid rgba(15,23,42,.08); border-radius:20px; padding:1.25rem; box-shadow:0 12px 40px rgba(30,64,175,.08); }
+    h1 { margin:0 0 .35rem; font-size:1.35rem; }
+    p { margin:0 0 1rem; color:#64748b; line-height:1.45; font-size:.92rem; }
+    label { display:block; margin:0 0 .85rem; font-size:.85rem; font-weight:600; }
+    input { width:100%; margin-top:.35rem; box-sizing:border-box; border:1px solid rgba(15,23,42,.12); border-radius:12px; padding:.75rem .85rem; font:inherit; }
+    button { width:100%; border:0; border-radius:12px; padding:.85rem 1rem; font:inherit; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .btn-primary { background:#2563eb; color:#fff; }
+    .btn-contact { background:#eff6ff; color:#1e40af; border:1px solid rgba(37,99,235,.28); margin-bottom:.85rem; }
+    .btn-contact strong { display:block; font-size:.95rem; }
+    .btn-contact span { display:block; font-size:.75rem; font-weight:500; opacity:.85; margin-top:.2rem; }
+    .divider { display:flex; align-items:center; gap:.55rem; margin:0 0 .85rem; color:#94a3b8; font-size:.75rem; font-weight:600; }
+    .divider::before, .divider::after { content:''; flex:1; height:1px; background:rgba(15,23,42,.1); }
+    .err { color:#dc2626; margin:.5rem 0 0; font-size:.85rem; }
+    .ok { color:#059669; margin:.5rem 0 0; font-size:.9rem; font-weight:600; }
+    .brand { font-size:.75rem; letter-spacing:.04em; text-transform:uppercase; color:#1e40af; font-weight:700; margin-bottom:.5rem; }
+    .filled { background:#f0fdf4; border-color:rgba(5,150,105,.35); }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <div class="brand">OneBook</div>
+      <h1 id="title">${shopName ? `Join ${shopName.replace(/[<>&]/g, '')}` : 'Join shop'}</h1>
+      <p id="lead">${shopName ? 'Use your phone contact to connect with this shop.' : 'Loading shop…'}</p>
+      <form id="form">
+        <button type="button" class="btn-contact" id="pickContact">
+          <strong>Use my contact from this phone</strong>
+          <span>Pick your name &amp; mobile from device contacts</span>
+        </button>
+        <div class="divider">or type manually</div>
+        <label>Name<input id="name" name="name" required maxlength="60" autocomplete="name" placeholder="Your name" /></label>
+        <label>Mobile<input id="phone" name="phone" required inputmode="tel" maxlength="10" pattern="[0-9]{10}" autocomplete="tel" placeholder="10-digit mobile" /></label>
+        <button type="submit" class="btn-primary" id="submit">Connect to shop</button>
+        <p class="err" id="error" hidden></p>
+        <p class="ok" id="success" hidden></p>
+      </form>
+    </div>
+  </main>
+  <script>
+    const appId = ${JSON.stringify(safeAppId)};
+    const form = document.getElementById('form');
+    const errorEl = document.getElementById('error');
+    const successEl = document.getElementById('success');
+    const submitBtn = document.getElementById('submit');
+    const pickBtn = document.getElementById('pickContact');
+    const nameEl = document.getElementById('name');
+    const phoneEl = document.getElementById('phone');
+    const titleEl = document.getElementById('title');
+    const leadEl = document.getElementById('lead');
+
+    function digitsOnly(value) {
+      return String(value || '').replace(/\\D/g, '');
+    }
+    function normalizePhone(raw) {
+      const digits = digitsOnly(raw);
+      if (digits.length === 10) return digits;
+      if (digits.length > 10) return digits.slice(-10);
+      return digits;
+    }
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.hidden = false;
+      successEl.hidden = true;
+    }
+    function clearError() {
+      errorEl.hidden = true;
+    }
+    function applyContact(name, phone) {
+      const mobile = normalizePhone(phone);
+      if (name) {
+        nameEl.value = String(name).trim().slice(0, 60);
+        nameEl.classList.add('filled');
+      }
+      if (mobile.length === 10) {
+        phoneEl.value = mobile;
+        phoneEl.classList.add('filled');
+      } else if (phone) {
+        phoneEl.value = normalizePhone(phone);
+      }
+    }
+    function contactsSupported() {
+      return !!(navigator.contacts && typeof navigator.contacts.select === 'function');
+    }
+
+    async function pickFromDevice() {
+      clearError();
+      if (!contactsSupported()) {
+        showError('This browser cannot open contacts. Type your name and 10-digit mobile below, or open this link in Chrome on Android.');
+        nameEl.focus();
+        return;
+      }
+      try {
+        pickBtn.disabled = true;
+        const selected = await navigator.contacts.select(['name', 'tel'], { multiple: false });
+        const first = selected && selected[0];
+        if (!first) return;
+        const name = (first.name && first.name[0]) || '';
+        const tel = (first.tel && first.tel.find(Boolean)) || '';
+        applyContact(name, tel);
+        if (!normalizePhone(tel) || normalizePhone(tel).length !== 10) {
+          showError('Selected contact needs a valid 10-digit mobile. Edit the number below.');
+          phoneEl.focus();
+          return;
+        }
+        if (!nameEl.value.trim()) {
+          showError('Add your name, then tap Connect.');
+          nameEl.focus();
+          return;
+        }
+        // Auto-submit once name + mobile are ready from the device contact
+        form.requestSubmit();
+      } catch (err) {
+        if (err && (err.name === 'AbortError' || /cancel|abort/i.test(String(err.message || '')))) return;
+        showError(err.message || 'Could not open contacts on this phone');
+      } finally {
+        pickBtn.disabled = false;
+      }
+    }
+
+    async function loadShop() {
+      try {
+        const res = await fetch('/api/public/join/' + encodeURIComponent(appId));
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Shop not found');
+        titleEl.textContent = 'Join ' + data.shopName;
+        leadEl.textContent = contactsSupported()
+          ? 'Tap the button to push your contact from this phone into ' + data.shopName + '.'
+          : 'Enter your name and mobile to connect with ' + data.shopName + '.';
+        if (contactsSupported()) {
+          // Offer contact push immediately after scan
+          setTimeout(function () { pickBtn.focus(); }, 250);
+        }
+      } catch (err) {
+        titleEl.textContent = 'Shop not found';
+        leadEl.textContent = err.message || 'Invalid QR code';
+        form.hidden = true;
+      }
+    }
+
+    pickBtn.addEventListener('click', function () { void pickFromDevice(); });
+
+    phoneEl.addEventListener('input', function () {
+      phoneEl.value = normalizePhone(phoneEl.value).slice(0, 10);
+    });
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      clearError();
+      successEl.hidden = true;
+      const name = nameEl.value.trim();
+      const phone = normalizePhone(phoneEl.value);
+      if (!name) {
+        showError('Name is required');
+        return;
+      }
+      if (phone.length !== 10) {
+        showError('Enter a valid 10-digit mobile number');
+        return;
+      }
+      submitBtn.disabled = true;
+      pickBtn.disabled = true;
+      try {
+        const res = await fetch('/api/public/join/' + encodeURIComponent(appId), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, phone }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Could not connect');
+        form.querySelectorAll('input,button').forEach((el) => { el.disabled = true; });
+        successEl.textContent = data.message || 'Connected successfully';
+        successEl.hidden = false;
+        submitBtn.textContent = 'Connected';
+        leadEl.textContent = 'Your contact was saved to the shop.';
+      } catch (err) {
+        showError(err.message || 'Could not connect');
+        submitBtn.disabled = false;
+        pickBtn.disabled = false;
+      }
+    });
+
+    loadShop();
+  </script>
+</body>
+</html>`);
+});
+
 function shopPublic(state) {
     return {
         appId: state.appId,
@@ -447,13 +822,26 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
     res.json({ ok: true });
 });
 app.get('/api/state', requireAuth, (req, res) => {
-    const state = loadState(req.account);
     const account = req.account;
+    const state = loadState(account);
+    if (account.role === 'shopkeeper') {
+        if (account.shopAppId && state.appId && account.shopAppId !== state.appId) {
+            res.status(403).json({ error: 'Shop mismatch — sign in again' });
+            return;
+        }
+        if (state.setupComplete) {
+            const member = state.users.some((u) => u.id === account.id);
+            if (!member) {
+                res.status(403).json({ error: 'Not a member of this shop' });
+                return;
+            }
+        }
+    }
     const generated = materializeRecurringBillings(state);
     if (generated > 0)
-        saveState(state, req.account);
+        saveState(state, account);
     if (account.role === 'customer') {
-        if (account.shopAppId !== state.appId) {
+        if (!account.shopAppId || account.shopAppId !== state.appId) {
             res.status(403).json({ error: 'Not linked to this shop' });
             return;
         }
@@ -509,10 +897,11 @@ app.post('/api/setup', requireShopkeeper, (req, res) => {
         return;
     }
     const createdAt = existing.createdAt || new Date().toISOString();
-    const cashAccount = defaultCashAccount(balance, createdAt);
+    const appId = existing.appId || emptyState().appId;
+    const cashAccount = defaultCashAccount(balance, createdAt, appId);
     const state = ensureCashAccounts({
         ...emptyState(),
-        appId: existing.appId || emptyState().appId,
+        appId,
         shopName: resolvedName,
         shopAddress: resolvedAddress,
         // Shop opening balance = Cash account starting balance
@@ -532,7 +921,7 @@ app.post('/api/setup', requireShopkeeper, (req, res) => {
         createdAt,
     });
     // Keep Cash account opening balance locked to the setup value.
-    const systemCash = state.cashAccounts.find((a) => a.isSystem || a.id === DEFAULT_CASH_ACCOUNT_ID);
+    const systemCash = state.cashAccounts.find((a) => a.isSystem || isSystemCashAccountId(a.id));
     if (systemCash)
         systemCash.openingBalance = balance;
     state.openingBalance = balance;
@@ -1388,10 +1777,17 @@ app.post('/api/transactions', requireShopkeeper, (req, res) => {
     const { type, category, amount, remarks, customerId, createdAt, cashAccountId, attachmentName, attachmentData, serviceId, } = req.body;
     const state = loadState(req.account);
     const account = req.account;
-    const user = state.users.find((u) => u.id === account.id) ??
-        state.users.find((u) => u.id === state.activeUserId);
+    if (account.shopAppId && state.appId && account.shopAppId !== state.appId) {
+        res.status(403).json({ error: 'Shop mismatch — sign in again' });
+        return;
+    }
+    const user = state.users.find((u) => u.id === account.id);
+    if (!user || user.role !== 'shopkeeper') {
+        res.status(403).json({ error: 'Not allowed to record for this shop' });
+        return;
+    }
     const value = Number(amount);
-    if (!user || !type || (type !== 'receipt' && type !== 'payment')) {
+    if (!type || (type !== 'receipt' && type !== 'payment')) {
         res.status(400).json({ error: 'Invalid transaction' });
         return;
     }
@@ -1530,6 +1926,15 @@ app.put('/api/transactions/:id', requireShopkeeper, (req, res) => {
         return;
     const { type, category, amount, remarks, customerId, createdAt, cashAccountId, attachmentName, attachmentData, clearAttachment, serviceId, } = req.body;
     const state = loadState(req.account);
+    const account = req.account;
+    if (account.shopAppId && state.appId && account.shopAppId !== state.appId) {
+        res.status(403).json({ error: 'Shop mismatch — sign in again' });
+        return;
+    }
+    if (!state.users.some((u) => u.id === account.id && u.role === 'shopkeeper')) {
+        res.status(403).json({ error: 'Not allowed to edit this shop' });
+        return;
+    }
     const index = state.transactions.findIndex((t) => t.id === req.params.id);
     if (index < 0) {
         res.status(404).json({ error: 'Transaction not found' });
@@ -1580,11 +1985,14 @@ app.put('/api/transactions/:id', requireShopkeeper, (req, res) => {
     const isPurchase = resolvedCategory === 'purchase';
     const isXorParty = isSales || isPurchase;
     const requestedCustomerId = customerId !== undefined ? String(customerId || '') : (existing.customerId ?? '');
+    const systemCashId =
+        state.cashAccounts.find((a) => a.isSystem || isSystemCashAccountId(a.id))?.id ||
+        (state.appId ? `${state.appId}:cash` : DEFAULT_CASH_ACCOUNT_ID);
     const requestedCashId = cashAccountId !== undefined
         ? String(cashAccountId || '')
         : isXorParty || isAdjustment
             ? (existing.cashAccountId ?? '')
-            : (existing.cashAccountId ?? DEFAULT_CASH_ACCOUNT_ID);
+            : (existing.cashAccountId ?? systemCashId);
     const hasCustomer = Boolean(requestedCustomerId);
     const hasAccount = Boolean(requestedCashId);
     if (isXorParty) {
@@ -1703,7 +2111,7 @@ app.put('/api/opening-balance', requireShopkeeper, (req, res) => {
         return;
     }
     state.openingBalance = amount;
-    const cash = state.cashAccounts.find((a) => a.isSystem || a.id === DEFAULT_CASH_ACCOUNT_ID);
+    const cash = state.cashAccounts.find((a) => a.isSystem || isSystemCashAccountId(a.id));
     if (cash)
         cash.openingBalance = amount;
     saveState(state, req.account);
@@ -1777,7 +2185,7 @@ app.delete('/api/cash-accounts/:id', requireShopkeeper, (req, res) => {
         res.status(404).json({ error: 'Account not found' });
         return;
     }
-    if (target.isSystem || target.id === DEFAULT_CASH_ACCOUNT_ID) {
+    if (target.isSystem || isSystemCashAccountId(target.id)) {
         res.status(400).json({ error: 'Cash account cannot be deleted' });
         return;
     }
