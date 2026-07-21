@@ -75,6 +75,13 @@ export function daysAfterPeriodEnd(periodStartDate, interval, billingDate) {
     const bill = new Date(`${billingDate}T12:00:00`);
     return Math.round((bill.getTime() - end.getTime()) / 86_400_000);
 }
+
+/** Bill date may be on/after period start (within or after the period). */
+export function isBillingDateAllowed(periodStartDate, billingDate) {
+    if (!isDateOnly(periodStartDate) || !isDateOnly(billingDate))
+        return false;
+    return billingDate >= periodStartDate;
+}
 export function billingDateForPeriod(periodStartDate, interval, delayDays) {
     return addDays(periodEndDate(periodStartDate, interval), delayDays);
 }
@@ -98,8 +105,13 @@ export function recurringPeriodLabel(periodStartDate, interval) {
         return `${start.getMonth() < 6 ? 'H1' : 'H2'} ${year}`;
     return String(year);
 }
-function generatedTransaction(state, schedule, billingDate, periodStartDate) {
-    const createdAt = uniqueTxCreatedAt(state.transactions, new Date(`${billingDate}T12:00:00`));
+function generatedTransaction(state, schedule, billingDate, periodStartDate, postedAt = new Date()) {
+    // Manual: sales/purchase date = when the user posts (editable later in Entry/Sales).
+    // Auto: keep the scheduled billing calendar day for catch-up posts.
+    const baseDate = schedule.autoBilling
+        ? new Date(`${billingDate}T12:00:00`)
+        : postedAt;
+    const createdAt = uniqueTxCreatedAt(state.transactions, baseDate);
     let id = newTxId(new Date(createdAt));
     const ids = new Set(state.transactions.map((tx) => tx.id));
     while (ids.has(id))
@@ -134,25 +146,81 @@ function advanceSchedule(schedule) {
     schedule.nextRunDate = billingDateForPeriod(schedule.nextPeriodStartDate, schedule.interval, schedule.billingDelayDays);
     schedule.updatedAt = new Date().toISOString();
 }
-export function postNextRecurringBill(state, schedule) {
+export function postNextRecurringBill(state, schedule, postedAt = new Date()) {
     const billingDate = schedule.nextRunDate;
     const exists = state.transactions.some((tx) => tx.recurringBillingId === schedule.id &&
         tx.recurringOccurrenceDate === billingDate);
     let transaction = null;
     if (!exists) {
-        transaction = generatedTransaction(state, schedule, billingDate, schedule.nextPeriodStartDate);
+        transaction = generatedTransaction(state, schedule, billingDate, schedule.nextPeriodStartDate, postedAt);
         state.transactions.unshift(transaction);
     }
     advanceSchedule(schedule);
     return transaction;
 }
+
+/**
+ * Earliest allowed stop date = last generated bill date for this schedule.
+ * Past ledger rows stay untouched; stop only blocks future generation.
+ */
+export function lastGeneratedBillDate(state, schedule) {
+    let latest = schedule.lastRunDate || null;
+    for (const tx of state.transactions ?? []) {
+        if (tx.recurringBillingId !== schedule.id)
+            continue;
+        const occurrence = tx.recurringOccurrenceDate
+            || (typeof tx.createdAt === 'string' ? tx.createdAt.slice(0, 10) : null);
+        if (occurrence && (!latest || occurrence > latest))
+            latest = occurrence;
+    }
+    return latest || schedule.effectiveDate || localDateString();
+}
+
+/** Earliest resume bill date = day after last generated bill (gap stays unbilled). */
+export function minResumeBillingDate(state, schedule) {
+    return addDays(lastGeneratedBillDate(state, schedule), 1);
+}
+
+/**
+ * Reactivate schedule from a chosen period/bill date.
+ * Does not rewrite past ledger entries; cursor jumps to resume point so the
+ * stopped gap is skipped in calculations and reports.
+ */
+export function applyResumeSchedule(schedule, { resumePeriodStart, resumeBillingDate }) {
+    if (!isDateOnly(resumePeriodStart)) {
+        throw new Error('Enter a valid resume period start');
+    }
+    if (!isDateOnly(resumeBillingDate)) {
+        throw new Error('Enter a valid resume bill date');
+    }
+    if (!isBillingDateAllowed(resumePeriodStart, resumeBillingDate)) {
+        throw new Error('Resume bill date must be on or after the period start');
+    }
+    schedule.active = true;
+    schedule.stopDate = null;
+    schedule.nextPeriodStartDate = resumePeriodStart;
+    schedule.nextRunDate = resumeBillingDate;
+    schedule.billingDelayDays = daysAfterPeriodEnd(
+        resumePeriodStart,
+        schedule.interval,
+        resumeBillingDate,
+    );
+    schedule.updatedAt = new Date().toISOString();
+    return schedule;
+}
+
+/** Post all due auto-billing schedules (nextRunDate <= today). Called on GET /api/state and after create/update/resume. Manual schedules are never touched here — they appear on the client Pending bill card. */
 export function materializeRecurringBillings(state, today = localDateString()) {
     let created = 0;
     for (const schedule of state.recurringBillings) {
         if (!schedule.active || !schedule.autoBilling)
             continue;
+        // Never post bills after an explicit stop date (safety if still marked active).
+        const stopCap = schedule.stopDate || null;
         let guard = 0;
         while (schedule.nextRunDate <= today && guard < MAX_OCCURRENCES_PER_RUN) {
+            if (stopCap && schedule.nextRunDate > stopCap)
+                break;
             if (postNextRecurringBill(state, schedule))
                 created += 1;
             guard += 1;
@@ -182,6 +250,7 @@ export function createRecurringBilling(input) {
         lastRunDate: null,
         autoBilling: input.autoBilling,
         active: true,
+        stopDate: null,
         createdByUserId: input.account.id,
         createdByName: input.account.name,
         createdAt: now,

@@ -5,10 +5,46 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, } from './src/store.js';
+import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
-import { billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isDateOnly, localDateString, materializeRecurringBillings, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
+import { applyResumeSchedule, billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isBillingDateAllowed, isDateOnly, lastGeneratedBillDate, localDateString, materializeRecurringBillings, minResumeBillingDate, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
+import { buildJoinPageHtml } from './src/joinPageHtml.js';
+import { getAppVersionInfo } from './src/appVersion.js';
+import {
+    insertWhatsAppMessageLog,
+    listWhatsAppMessageLogs,
+    summarizeWhatsAppLogs,
+    whatsappMessageUnitCost,
+} from './src/whatsappLogs.js';
+import {
+    createWhatsAppCampaign,
+    createWhatsAppTemplate,
+    deleteWhatsAppCampaign,
+    deleteWhatsAppTemplate,
+    getWhatsAppConfig,
+    listWhatsAppCampaigns,
+    listWhatsAppChatMessages,
+    listWhatsAppChats,
+    listWhatsAppTemplates,
+    saveWhatsAppConfig,
+    sendWhatsAppCampaignMessage,
+    updateWhatsAppCampaign,
+    updateWhatsAppTemplate,
+} from './src/whatsappManager.js';
+import {
+    buildAmortizationSchedule,
+    calculateEmi,
+    createCustomerLoan,
+    getLoanWithSchedule,
+    getShopLoanOverview,
+    listLoansForCustomer,
+    materializeLoanEmis,
+    payLoanEmi,
+    precloseLoan,
+    updateCustomerLoan,
+} from './src/loans.js';
 const app = express();
 const PORT = Number(process.env.PORT || 4000);
 const OTP_TTL_MS = 1000 * 60 * 5;
@@ -192,6 +228,11 @@ app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
 });
 
+/** Public: latest Android/app build for in-app update prompt. */
+app.get('/api/app/version', (_req, res) => {
+    res.json(getAppVersionInfo());
+});
+
 function publicJoinBaseUrl(req) {
     const configured = (process.env.PUBLIC_JOIN_BASE || process.env.PUBLIC_APP_URL || '').replace(/\/$/, '');
     if (configured)
@@ -259,15 +300,15 @@ app.post('/api/public/join/:appId', async (req, res) => {
         return;
     }
     const auth = loadAuth();
-    if (auth.accounts.some((a) => normalizePhone(a.phone) === phone)) {
+    if (auth.accounts.some((a) => normalizePhone(a.phone) === phone && a.shopAppId === shop.appId)) {
         res.status(409).json({
-            error: 'This mobile is already registered. Login with OTP instead.',
+            error: 'This mobile is already linked to this shop. Login with OTP instead.',
         });
         return;
     }
     try {
-        if (await phoneExistsInDatabase(phone)) {
-            res.status(409).json({ error: 'This mobile already exists in the database' });
+        if (await phoneExistsInShop(phone, shop.appId)) {
+            res.status(409).json({ error: 'This mobile is already linked to this shop' });
             return;
         }
     }
@@ -324,205 +365,7 @@ app.get('/join/:appId', (req, res) => {
     const appId = String(req.params.appId || '').trim();
     const shop = getShopByAppId(appId);
     const shopName = shop?.setupComplete ? shop.shopName : '';
-    const safeAppId = appId.replace(/[^a-zA-Z0-9_-]/g, '');
-    const title = shopName ? `Join ${shopName}` : 'Join shop';
-    res.type('html').send(`<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#1e40af" />
-  <title>${title.replace(/[<>&]/g, '')}</title>
-  <style>
-    :root { color-scheme: light; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    body { margin: 0; min-height: 100dvh; background: linear-gradient(180deg,#eff6ff,#f8fafc); color:#0f172a; }
-    main { max-width: 420px; margin: 0 auto; padding: 1.5rem 1.1rem 2rem; }
-    .card { background:#fff; border:1px solid rgba(15,23,42,.08); border-radius:20px; padding:1.25rem; box-shadow:0 12px 40px rgba(30,64,175,.08); }
-    h1 { margin:0 0 .35rem; font-size:1.35rem; }
-    p { margin:0 0 1rem; color:#64748b; line-height:1.45; font-size:.92rem; }
-    label { display:block; margin:0 0 .85rem; font-size:.85rem; font-weight:600; }
-    input { width:100%; margin-top:.35rem; box-sizing:border-box; border:1px solid rgba(15,23,42,.12); border-radius:12px; padding:.75rem .85rem; font:inherit; }
-    button { width:100%; border:0; border-radius:12px; padding:.85rem 1rem; font:inherit; font-weight:700; cursor:pointer; }
-    button:disabled { opacity:.6; cursor:not-allowed; }
-    .btn-primary { background:#2563eb; color:#fff; }
-    .btn-contact { background:#eff6ff; color:#1e40af; border:1px solid rgba(37,99,235,.28); margin-bottom:.85rem; }
-    .btn-contact strong { display:block; font-size:.95rem; }
-    .btn-contact span { display:block; font-size:.75rem; font-weight:500; opacity:.85; margin-top:.2rem; }
-    .divider { display:flex; align-items:center; gap:.55rem; margin:0 0 .85rem; color:#94a3b8; font-size:.75rem; font-weight:600; }
-    .divider::before, .divider::after { content:''; flex:1; height:1px; background:rgba(15,23,42,.1); }
-    .err { color:#dc2626; margin:.5rem 0 0; font-size:.85rem; }
-    .ok { color:#059669; margin:.5rem 0 0; font-size:.9rem; font-weight:600; }
-    .brand { font-size:.75rem; letter-spacing:.04em; text-transform:uppercase; color:#1e40af; font-weight:700; margin-bottom:.5rem; }
-    .filled { background:#f0fdf4; border-color:rgba(5,150,105,.35); }
-  </style>
-</head>
-<body>
-  <main>
-    <div class="card">
-      <div class="brand">OneBook</div>
-      <h1 id="title">${shopName ? `Join ${shopName.replace(/[<>&]/g, '')}` : 'Join shop'}</h1>
-      <p id="lead">${shopName ? 'Use your phone contact to connect with this shop.' : 'Loading shop…'}</p>
-      <form id="form">
-        <button type="button" class="btn-contact" id="pickContact">
-          <strong>Use my contact from this phone</strong>
-          <span>Pick your name &amp; mobile from device contacts</span>
-        </button>
-        <div class="divider">or type manually</div>
-        <label>Name<input id="name" name="name" required maxlength="60" autocomplete="name" placeholder="Your name" /></label>
-        <label>Mobile<input id="phone" name="phone" required inputmode="tel" maxlength="10" pattern="[0-9]{10}" autocomplete="tel" placeholder="10-digit mobile" /></label>
-        <button type="submit" class="btn-primary" id="submit">Connect to shop</button>
-        <p class="err" id="error" hidden></p>
-        <p class="ok" id="success" hidden></p>
-      </form>
-    </div>
-  </main>
-  <script>
-    const appId = ${JSON.stringify(safeAppId)};
-    const form = document.getElementById('form');
-    const errorEl = document.getElementById('error');
-    const successEl = document.getElementById('success');
-    const submitBtn = document.getElementById('submit');
-    const pickBtn = document.getElementById('pickContact');
-    const nameEl = document.getElementById('name');
-    const phoneEl = document.getElementById('phone');
-    const titleEl = document.getElementById('title');
-    const leadEl = document.getElementById('lead');
-
-    function digitsOnly(value) {
-      return String(value || '').replace(/\\D/g, '');
-    }
-    function normalizePhone(raw) {
-      const digits = digitsOnly(raw);
-      if (digits.length === 10) return digits;
-      if (digits.length > 10) return digits.slice(-10);
-      return digits;
-    }
-    function showError(msg) {
-      errorEl.textContent = msg;
-      errorEl.hidden = false;
-      successEl.hidden = true;
-    }
-    function clearError() {
-      errorEl.hidden = true;
-    }
-    function applyContact(name, phone) {
-      const mobile = normalizePhone(phone);
-      if (name) {
-        nameEl.value = String(name).trim().slice(0, 60);
-        nameEl.classList.add('filled');
-      }
-      if (mobile.length === 10) {
-        phoneEl.value = mobile;
-        phoneEl.classList.add('filled');
-      } else if (phone) {
-        phoneEl.value = normalizePhone(phone);
-      }
-    }
-    function contactsSupported() {
-      return !!(navigator.contacts && typeof navigator.contacts.select === 'function');
-    }
-
-    async function pickFromDevice() {
-      clearError();
-      if (!contactsSupported()) {
-        showError('This browser cannot open contacts. Type your name and 10-digit mobile below, or open this link in Chrome on Android.');
-        nameEl.focus();
-        return;
-      }
-      try {
-        pickBtn.disabled = true;
-        const selected = await navigator.contacts.select(['name', 'tel'], { multiple: false });
-        const first = selected && selected[0];
-        if (!first) return;
-        const name = (first.name && first.name[0]) || '';
-        const tel = (first.tel && first.tel.find(Boolean)) || '';
-        applyContact(name, tel);
-        if (!normalizePhone(tel) || normalizePhone(tel).length !== 10) {
-          showError('Selected contact needs a valid 10-digit mobile. Edit the number below.');
-          phoneEl.focus();
-          return;
-        }
-        if (!nameEl.value.trim()) {
-          showError('Add your name, then tap Connect.');
-          nameEl.focus();
-          return;
-        }
-        // Auto-submit once name + mobile are ready from the device contact
-        form.requestSubmit();
-      } catch (err) {
-        if (err && (err.name === 'AbortError' || /cancel|abort/i.test(String(err.message || '')))) return;
-        showError(err.message || 'Could not open contacts on this phone');
-      } finally {
-        pickBtn.disabled = false;
-      }
-    }
-
-    async function loadShop() {
-      try {
-        const res = await fetch('/api/public/join/' + encodeURIComponent(appId));
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Shop not found');
-        titleEl.textContent = 'Join ' + data.shopName;
-        leadEl.textContent = contactsSupported()
-          ? 'Tap the button to push your contact from this phone into ' + data.shopName + '.'
-          : 'Enter your name and mobile to connect with ' + data.shopName + '.';
-        if (contactsSupported()) {
-          // Offer contact push immediately after scan
-          setTimeout(function () { pickBtn.focus(); }, 250);
-        }
-      } catch (err) {
-        titleEl.textContent = 'Shop not found';
-        leadEl.textContent = err.message || 'Invalid QR code';
-        form.hidden = true;
-      }
-    }
-
-    pickBtn.addEventListener('click', function () { void pickFromDevice(); });
-
-    phoneEl.addEventListener('input', function () {
-      phoneEl.value = normalizePhone(phoneEl.value).slice(0, 10);
-    });
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      clearError();
-      successEl.hidden = true;
-      const name = nameEl.value.trim();
-      const phone = normalizePhone(phoneEl.value);
-      if (!name) {
-        showError('Name is required');
-        return;
-      }
-      if (phone.length !== 10) {
-        showError('Enter a valid 10-digit mobile number');
-        return;
-      }
-      submitBtn.disabled = true;
-      pickBtn.disabled = true;
-      try {
-        const res = await fetch('/api/public/join/' + encodeURIComponent(appId), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name, phone }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Could not connect');
-        form.querySelectorAll('input,button').forEach((el) => { el.disabled = true; });
-        successEl.textContent = data.message || 'Connected successfully';
-        successEl.hidden = false;
-        submitBtn.textContent = 'Connected';
-        leadEl.textContent = 'Your contact was saved to the shop.';
-      } catch (err) {
-        showError(err.message || 'Could not connect');
-        submitBtn.disabled = false;
-        pickBtn.disabled = false;
-      }
-    });
-
-    loadShop();
-  </script>
-</body>
-</html>`);
+    res.type('html').send(buildJoinPageHtml({ appId, shopName }));
 });
 
 function shopPublic(state) {
@@ -618,8 +461,12 @@ app.post('/api/auth/verify-register', (req, res) => {
         res.status(401).json({ error: 'Invalid or expired OTP' });
         return;
     }
-    // Remove unfinished / duplicate accounts for this phone
-    auth.accounts = auth.accounts.filter((a) => a.phone !== phone);
+    // Remove unfinished shopkeeper drafts for this phone only (keep other profiles)
+    auth.accounts = auth.accounts.filter((a) => !(a.phone === phone && a.role === 'shopkeeper' && !a.shopAppId && !a.phoneVerified));
+    if (auth.accounts.some((a) => a.phone === phone && a.role === 'shopkeeper' && a.phoneVerified)) {
+        res.status(409).json({ error: 'Phone already has a business. Login and open Create business.' });
+        return;
+    }
     const account = {
         id: newId(),
         name: pending.name,
@@ -656,8 +503,8 @@ app.post('/api/auth/request-otp', async (req, res) => {
         return;
     }
     const auth = loadAuth();
-    const account = auth.accounts.find((a) => a.phone === phone);
-    if (!account) {
+    const accounts = auth.accounts.filter((a) => a.phone === phone);
+    if (accounts.length === 0) {
         res.status(404).json({ error: 'Phone not registered. Please register first.' });
         return;
     }
@@ -680,6 +527,7 @@ app.post('/api/auth/request-otp', async (req, res) => {
         channel: issued.channel,
         ...(issued.channel === 'demo' ? { devOtp: issued.code } : {}),
         expiresInSeconds: issued.expiresInSeconds,
+        profileCount: accounts.length,
     });
 });
 app.post('/api/auth/verify-otp', (req, res) => {
@@ -695,21 +543,156 @@ app.post('/api/auth/verify-otp', (req, res) => {
         res.status(401).json({ error: 'Invalid or expired OTP' });
         return;
     }
-    const idx = auth.accounts.findIndex((a) => a.phone === phone);
-    if (idx < 0) {
+    const matches = auth.accounts
+        .map((a, idx) => ({ a, idx }))
+        .filter(({ a }) => a.phone === phone);
+    if (matches.length === 0) {
         res.status(404).json({ error: 'Account not found' });
         return;
     }
-    auth.accounts[idx] = { ...auth.accounts[idx], phoneVerified: true };
+    for (const { idx } of matches) {
+        auth.accounts[idx] = { ...auth.accounts[idx], phoneVerified: true };
+    }
     auth.otps = auth.otps.filter((o) => !(o.phone === phone && o.purpose === 'login'));
     saveAuth(auth);
-    const account = auth.accounts[idx];
+    const profileTicket = issueProfileTicket(phone);
+    const profiles = profilesForPhone(phone);
+    res.json({
+        profileTicket,
+        phone,
+        profiles,
+        expiresInSeconds: 15 * 60,
+    });
+});
+app.post('/api/auth/select-profile', (req, res) => {
+    const ticket = String(req.body?.profileTicket ?? '');
+    const accountId = String(req.body?.accountId ?? '');
+    const phone = peekProfileTicket(ticket);
+    if (!phone) {
+        res.status(401).json({ error: 'Session expired. Please login again.' });
+        return;
+    }
+    const auth = loadAuth();
+    const account = auth.accounts.find((a) => a.id === accountId && a.phone === phone);
+    if (!account) {
+        res.status(404).json({ error: 'Profile not found for this mobile' });
+        return;
+    }
+    consumeProfileTicket(ticket);
     const token = createSession(account.id);
     const state = loadState(account);
     res.json({
         token,
         account: publicAccount(account),
         shop: shopPublic(state),
+        message: account.role === 'shopkeeper' ? `Opened ${state.shopName || 'your business'}` : `Opened as customer · ${state.shopName || 'shop'}`,
+    });
+});
+app.post('/api/auth/create-shop', (req, res) => {
+    const ticket = String(req.body?.profileTicket ?? '');
+    const shopName = String(req.body?.shopName ?? '').trim();
+    const shopAddress = String(req.body?.shopAddress ?? '').trim();
+    let name = String(req.body?.name ?? '').trim();
+    let phone = peekProfileTicket(ticket);
+    let fromAuth = false;
+    if (!phone) {
+        // Allow logged-in users to add another business
+        const header = req.headers.authorization ?? '';
+        const bearer = header.startsWith('Bearer ') ? header.slice(7) : '';
+        if (bearer) {
+            const auth = loadAuth();
+            const session = auth.sessions.find((s) => s.token === bearer && s.expiresAt > Date.now());
+            const account = session ? auth.accounts.find((a) => a.id === session.userId) : null;
+            if (account) {
+                phone = account.phone;
+                if (!name) name = account.name;
+                fromAuth = true;
+            }
+        }
+    }
+    if (!phone) {
+        res.status(401).json({ error: 'Session expired. Please login again.' });
+        return;
+    }
+    if (!shopName) {
+        res.status(400).json({ error: 'Business name is required' });
+        return;
+    }
+    if (shopName.length > 80) {
+        res.status(400).json({ error: 'Business name is too long' });
+        return;
+    }
+    if (!shopAddress) {
+        res.status(400).json({ error: 'Business address is required' });
+        return;
+    }
+    if (shopAddress.length > 240) {
+        res.status(400).json({ error: 'Business address is too long' });
+        return;
+    }
+    const auth = loadAuth();
+    const siblings = auth.accounts.filter((a) => a.phone === phone);
+    if (!name) {
+        name = siblings[0]?.name || 'Owner';
+    }
+    if (name.length < 2) {
+        res.status(400).json({ error: 'Enter a valid name (at least 2 characters)' });
+        return;
+    }
+    const createdAt = new Date().toISOString();
+    const account = {
+        id: newId(),
+        name,
+        phone,
+        email: siblings[0]?.email ?? null,
+        role: 'shopkeeper',
+        shopAppId: null,
+        phoneVerified: true,
+        createdAt,
+    };
+    auth.accounts.push(account);
+    saveAuth(auth);
+    const draft = ensureShopkeeperDraft(account, { shopName, shopAddress });
+    account.shopAppId = draft.appId;
+    const auth2 = loadAuth();
+    const idx = auth2.accounts.findIndex((a) => a.id === account.id);
+    if (idx >= 0) {
+        auth2.accounts[idx] = { ...auth2.accounts[idx], shopAppId: draft.appId };
+        saveAuth(auth2);
+    }
+    saveShopByAppId(draft);
+    if (ticket) consumeProfileTicket(ticket);
+    const token = createSession(account.id);
+    res.status(201).json({
+        token,
+        account: publicAccount({ ...account, shopAppId: draft.appId }),
+        shop: shopPublic(draft),
+        message: `Business “${shopName}” created`,
+        fromAuth,
+    });
+});
+app.get('/api/auth/profiles', requireAuth, (req, res) => {
+    res.json({
+        phone: req.account.phone,
+        profiles: profilesForPhone(req.account.phone),
+        activeAccountId: req.account.id,
+    });
+});
+app.post('/api/auth/switch-profile', requireAuth, (req, res) => {
+    const accountId = String(req.body?.accountId ?? '');
+    const auth = loadAuth();
+    const account = auth.accounts.find((a) => a.id === accountId && a.phone === req.account.phone);
+    if (!account) {
+        res.status(404).json({ error: 'Profile not found for this mobile' });
+        return;
+    }
+    const token = createSession(account.id);
+    const state = loadState(account);
+    res.json({
+        token,
+        account: publicAccount(account),
+        shop: shopPublic(state),
+        message: account.role === 'shopkeeper' ? `Switched to ${state.shopName || 'business'}` : `Switched to customer · ${state.shopName || 'shop'}`,
     });
 });
 app.get('/api/auth/me', requireAuth, (req, res) => {
@@ -821,7 +804,7 @@ app.post('/api/auth/logout', requireAuth, (req, res) => {
     saveAuth(auth);
     res.json({ ok: true });
 });
-app.get('/api/state', requireAuth, (req, res) => {
+app.get('/api/state', requireAuth, async (req, res) => {
     const account = req.account;
     const state = loadState(account);
     if (account.role === 'shopkeeper') {
@@ -838,7 +821,14 @@ app.get('/api/state', requireAuth, (req, res) => {
         }
     }
     const generated = materializeRecurringBillings(state);
-    if (generated > 0)
+    let loanGenerated = 0;
+    try {
+        loanGenerated = await materializeLoanEmis(state);
+    }
+    catch (err) {
+        console.warn('[loans] materialize on state load failed:', err instanceof Error ? err.message : err);
+    }
+    if (generated > 0 || loanGenerated > 0)
         saveState(state, account);
     if (account.role === 'customer') {
         if (!account.shopAppId || account.shopAppId !== state.appId) {
@@ -976,16 +966,16 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
         return;
     }
     const auth = loadAuth();
-    if (phone && auth.accounts.some((a) => normalizePhone(a.phone) === phone)) {
+    if (phone && auth.accounts.some((a) => normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
         res.status(409).json({
-            error: 'This mobile number is already registered. Ask them to login with OTP.',
+            error: 'This mobile number is already linked to this shop. Ask them to login with OTP.',
         });
         return;
     }
     try {
-        if (phone && (await phoneExistsInDatabase(phone))) {
+        if (phone && (await phoneExistsInShop(phone, state.appId))) {
             res.status(409).json({
-                error: 'This mobile number already exists in the database',
+                error: 'This mobile number is already linked to this shop',
             });
             return;
         }
@@ -1027,7 +1017,7 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile number already exists in the database' });
+            res.status(409).json({ error: 'This mobile number is already linked to this shop' });
             return;
         }
         console.error('[users] create failed', err);
@@ -1097,13 +1087,13 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
         return;
     }
     const auth = loadAuth();
-    if (auth.accounts.some((a) => a.id !== id && normalizePhone(a.phone) === phone)) {
-        res.status(409).json({ error: 'This mobile number already has an account' });
+    if (auth.accounts.some((a) => a.id !== id && normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
+        res.status(409).json({ error: 'This mobile number is already used in this shop' });
         return;
     }
     try {
-        if (await phoneExistsInDatabase(phone, id)) {
-            res.status(409).json({ error: 'This mobile number already exists in the database' });
+        if (await phoneExistsInShop(phone, state.appId, id)) {
+            res.status(409).json({ error: 'This mobile number is already used in this shop' });
             return;
         }
     }
@@ -1229,7 +1219,6 @@ app.post('/api/recurring-billings', requireShopkeeper, (req, res) => {
     const interval = String(req.body?.interval ?? '');
     const effectiveDate = String(req.body?.effectiveDate ?? '');
     const transactionCategory = String(req.body?.transactionCategory ?? 'sales') === 'purchase' ? 'purchase' : 'sales';
-    const autoBilling = req.body?.autoBilling !== false;
     const serviceLookup = resolveService(state, req.body?.serviceId);
     const customer = state.users.find((user) => user.id === customerId && user.role === 'customer') ?? null;
     if (!customer) {
@@ -1258,10 +1247,14 @@ app.post('/api/recurring-billings', requireShopkeeper, (req, res) => {
         return;
     }
     const billingDate = String(req.body?.billingDate ?? billingDateForPeriod(effectiveDate, interval, 1));
-    if (!isDateOnly(billingDate) ||
-        daysAfterPeriodEnd(effectiveDate, interval, billingDate) < 1) {
-        res.status(400).json({ error: 'Billing date must be after the billing period ends' });
+    if (!isDateOnly(billingDate) || !isBillingDateAllowed(effectiveDate, billingDate)) {
+        res.status(400).json({ error: 'Billing date must be on or after the period start' });
         return;
+    }
+    const today = localDateString();
+    let autoBilling = req.body?.autoBilling !== false;
+    if (billingDate < today) {
+        autoBilling = false;
     }
     const billing = createRecurringBilling({
         account: req.account,
@@ -1303,7 +1296,7 @@ app.put('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
         : String(req.body.transactionCategory) === 'purchase'
             ? 'purchase'
             : 'sales';
-    const autoBilling = req.body?.autoBilling === undefined ? current.autoBilling : Boolean(req.body.autoBilling);
+    let autoBilling = req.body?.autoBilling === undefined ? current.autoBilling : Boolean(req.body.autoBilling);
     const serviceLookup = resolveService(state, req.body?.serviceId === undefined ? current.serviceId : req.body.serviceId);
     if (!serviceLookup.ok) {
         res.status(404).json({ error: serviceLookup.error });
@@ -1326,16 +1319,25 @@ app.put('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
         res.status(400).json({ error: 'Enter a valid billing period' });
         return;
     }
-    const currentInitialBillingDate = billingDateForPeriod(effectiveDate, interval, current.billingDelayDays);
-    const billingDate = String(req.body?.billingDate ?? currentInitialBillingDate);
+    // Prefer explicit bill/due date from the client. Fall back to delay-based date
+    // for the period being edited (form sends next period start as effectiveDate).
+    const hasBillingDate = req.body?.billingDate !== undefined && req.body?.billingDate !== null && req.body?.billingDate !== '';
+    const billingDate = hasBillingDate
+        ? String(req.body.billingDate)
+        : billingDateForPeriod(effectiveDate, interval, Number(current.billingDelayDays) || 0);
     const billingDelayDays = daysAfterPeriodEnd(effectiveDate, interval, billingDate);
-    if (!isDateOnly(billingDate) || billingDelayDays < 1) {
-        res.status(400).json({ error: 'Billing date must be after the billing period ends' });
+    if (!isDateOnly(billingDate) || !isBillingDateAllowed(effectiveDate, billingDate)) {
+        res.status(400).json({ error: 'Billing date must be on or after the period start' });
         return;
     }
+    if (billingDate < localDateString()) {
+        autoBilling = false;
+    }
+    const currentDelay = Number(current.billingDelayDays) || 0;
     const scheduleChanged = interval !== current.interval ||
-        effectiveDate !== current.effectiveDate ||
-        billingDelayDays !== current.billingDelayDays;
+        effectiveDate !== current.nextPeriodStartDate ||
+        billingDate !== current.nextRunDate ||
+        billingDelayDays !== currentDelay;
     const updated = {
         ...current,
         amount,
@@ -1344,14 +1346,12 @@ app.put('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
         serviceName: serviceLookup.service?.name ?? null,
         transactionCategory,
         interval,
-        effectiveDate,
-        nextPeriodStartDate: scheduleChanged
-            ? effectiveDate
-            : current.nextPeriodStartDate,
+        // Keep original start once any period has been posted; otherwise adopt form period.
+        effectiveDate: current.lastRunDate ? current.effectiveDate : effectiveDate,
+        nextPeriodStartDate: scheduleChanged ? effectiveDate : current.nextPeriodStartDate,
         billingDelayDays,
-        nextRunDate: scheduleChanged
-            ? billingDate
-            : current.nextRunDate,
+        // Always apply bill/due date when the schedule definition or due date changed.
+        nextRunDate: scheduleChanged ? billingDate : current.nextRunDate,
         autoBilling,
         updatedAt: new Date().toISOString(),
     };
@@ -1370,12 +1370,30 @@ app.post('/api/recurring-billings/:id/stop', requireShopkeeper, (req, res) => {
         res.status(404).json({ error: 'Recurring billing not found' });
         return;
     }
+    if (!billing.active) {
+        res.status(400).json({ error: 'This schedule is already stopped' });
+        return;
+    }
+    const minStopDate = lastGeneratedBillDate(state, billing);
+    const stopDate = String(req.body?.stopDate || localDateString()).trim();
+    if (!isDateOnly(stopDate)) {
+        res.status(400).json({ error: 'Enter a valid stop date' });
+        return;
+    }
+    if (stopDate < minStopDate) {
+        res.status(400).json({
+            error: `Stop date cannot be earlier than the last generated bill (${minStopDate}). Past ledger entries stay unchanged.`,
+        });
+        return;
+    }
+    // Deactivate schedule only — never rewrite/delete generated transactions.
     billing.active = false;
+    billing.stopDate = stopDate;
     billing.updatedAt = new Date().toISOString();
     saveState(state, req.account);
     res.json({ state, recurringBilling: billing });
 });
-app.post('/api/recurring-billings/:id/post', requireShopkeeper, (req, res) => {
+app.post('/api/recurring-billings/:id/post', requireShopkeeper, async (req, res) => {
     const state = loadState(req.account);
     const billing = state.recurringBillings.find((item) => item.id === req.params.id);
     if (!billing) {
@@ -1384,6 +1402,12 @@ app.post('/api/recurring-billings/:id/post', requireShopkeeper, (req, res) => {
     }
     if (!billing.active) {
         res.status(400).json({ error: 'Resume this recurring billing before posting' });
+        return;
+    }
+    if (billing.stopDate && billing.nextRunDate > billing.stopDate) {
+        res.status(400).json({
+            error: `This schedule stops on ${billing.stopDate}. No further bills can be posted.`,
+        });
         return;
     }
     if (billing.nextRunDate > localDateString()) {
@@ -1406,8 +1430,37 @@ app.post('/api/recurring-billings/:id/resume', requireShopkeeper, (req, res) => 
         res.status(404).json({ error: 'Recurring billing not found' });
         return;
     }
-    billing.active = true;
-    billing.updatedAt = new Date().toISOString();
+    if (billing.active) {
+        res.status(400).json({ error: 'This schedule is already active' });
+        return;
+    }
+    const minBill = minResumeBillingDate(state, billing);
+    const resumeBillingDate = String(req.body?.resumeBillingDate || req.body?.resumeDate || '').trim();
+    const resumePeriodStart = String(
+        req.body?.resumePeriodStart || req.body?.effectiveDate || resumeBillingDate,
+    ).trim();
+    if (!isDateOnly(resumeBillingDate)) {
+        res.status(400).json({ error: 'Enter a valid resume bill date' });
+        return;
+    }
+    if (!isDateOnly(resumePeriodStart)) {
+        res.status(400).json({ error: 'Enter a valid resume period start' });
+        return;
+    }
+    if (resumeBillingDate < minBill) {
+        res.status(400).json({
+            error: `Resume bill date cannot be earlier than ${minBill}. That keeps the stopped gap out of calculations and reports.`,
+        });
+        return;
+    }
+    try {
+        applyResumeSchedule(billing, { resumePeriodStart, resumeBillingDate });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not resume' });
+        return;
+    }
+    // Only materialize from the new resume cursor forward (never rewrites past entries).
     materializeRecurringBillings(state);
     saveState(state, req.account);
     const totals = calcTotals(state.openingBalance, state.transactions);
@@ -1422,11 +1475,162 @@ app.delete('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
         res.status(404).json({ error: 'Recurring billing not found' });
         return;
     }
+    // Remove schedule only. Generated transactions remain normal ledger entries.
     state.recurringBillings = state.recurringBillings.filter((billing) => billing.id !== req.params.id);
-    // Generated transactions remain normal ledger entries and can be deleted individually.
     saveState(state, req.account);
     res.json({ state });
 });
+
+app.post('/api/loans/preview', requireShopkeeper, (req, res) => {
+    try {
+        const principal = Number(req.body?.principal);
+        const interestRate = Number(req.body?.interestRate);
+        const tenureMonths = Math.round(Number(req.body?.tenureMonths));
+        const emiStartDate = String(req.body?.emiStartDate || req.body?.startDate || localDateString());
+        const emiAmount = calculateEmi(principal, interestRate, tenureMonths);
+        const schedule = buildAmortizationSchedule(principal, interestRate, tenureMonths, emiStartDate);
+        res.json({ emiAmount, schedule });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid loan input' });
+    }
+});
+
+app.get('/api/loans', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const loanGenerated = await materializeLoanEmis(state);
+        if (loanGenerated > 0)
+            saveState(state, req.account);
+        const overview = await getShopLoanOverview(state);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ ...overview, state, ...totals });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load loans' });
+    }
+});
+
+app.get('/api/customers/:customerId/loans', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const loanGenerated = await materializeLoanEmis(state);
+        if (loanGenerated > 0)
+            saveState(state, req.account);
+        const loans = await listLoansForCustomer(state.appId, req.params.customerId);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ loans, state, ...totals });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load loans' });
+    }
+});
+
+app.post('/api/customers/:customerId/loans', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const detail = await createCustomerLoan(state, req.account, {
+            customerId: req.params.customerId,
+            principal: req.body?.principal,
+            interestRate: req.body?.interestRate,
+            tenureMonths: req.body?.tenureMonths,
+            loanDate: req.body?.loanDate || req.body?.startDate,
+            emiStartDate: req.body?.emiStartDate,
+            cashAccountId: req.body?.cashAccountId,
+            remarks: req.body?.remarks,
+        });
+        await materializeLoanEmis(state);
+        saveState(state, req.account);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.status(201).json({ ...detail, state, ...totals });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not create loan' });
+    }
+});
+
+app.get('/api/loans/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const loanGenerated = await materializeLoanEmis(state);
+        if (loanGenerated > 0)
+            saveState(state, req.account);
+        const detail = await getLoanWithSchedule(state.appId, req.params.id);
+        if (!detail) {
+            res.status(404).json({ error: 'Loan not found' });
+            return;
+        }
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ ...detail, state, ...totals });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load loan' });
+    }
+});
+
+app.put('/api/loans/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const detail = await updateCustomerLoan(state, req.params.id, {
+            principal: req.body?.principal,
+            interestRate: req.body?.interestRate,
+            tenureMonths: req.body?.tenureMonths,
+            loanDate: req.body?.loanDate || req.body?.startDate,
+            emiStartDate: req.body?.emiStartDate,
+            remarks: req.body?.remarks,
+        });
+        saveState(state, req.account);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ ...detail, state, ...totals });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not update loan' });
+    }
+});
+
+app.post('/api/loans/:id/pay-emi', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const cashAccountId = String(req.body?.cashAccountId ?? '');
+        const installmentId = String(req.body?.installmentId ?? '');
+        if (!installmentId)
+            throw new Error('Installment is required');
+        if (!cashAccountId)
+            throw new Error('Select a cash/bank account');
+        const detail = await payLoanEmi(
+            state,
+            req.account,
+            req.params.id,
+            installmentId,
+            cashAccountId,
+            req.body?.amount,
+        );
+        saveState(state, req.account);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ ...detail, state, ...totals });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not pay EMI' });
+    }
+});
+
+app.post('/api/loans/:id/preclose', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const cashAccountId = String(req.body?.cashAccountId ?? '');
+        const preclosureCharge = Number(req.body?.preclosureCharge ?? 0);
+        if (!cashAccountId)
+            throw new Error('Select a cash/bank account');
+        const detail = await precloseLoan(state, req.account, req.params.id, preclosureCharge, cashAccountId);
+        saveState(state, req.account);
+        const totals = calcTotals(state.openingBalance, state.transactions);
+        res.json({ ...detail, state, ...totals });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not pre-close loan' });
+    }
+});
+
 app.post('/api/services', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
     const name = String(req.body?.name ?? '').trim();
@@ -1656,6 +1860,10 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
         return;
     }
     const state = loadState(req.account);
+    if (!state.appId) {
+        res.status(400).json({ error: 'Complete shop setup first' });
+        return;
+    }
     const shopName = String(req.body?.shopName ?? state.shopName ?? 'Shop').trim() || 'Shop';
     const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
     if (rawItems.length === 0) {
@@ -1699,12 +1907,32 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
             shopName,
             balance,
         });
+        try {
+            await insertWhatsAppMessageLog({
+                shopAppId: state.appId,
+                customerId,
+                customerName,
+                phone,
+                kind: 'payment_reminder',
+                templateName: sent.templateName || 'payment_reminder',
+                messageBody: sent.messageBody || `Payment reminder · Rs. ${Math.abs(balance)}`,
+                ok: sent.ok,
+                error: sent.ok ? null : sent.error,
+                providerMessageId: sent.messageId || sent.wamid || null,
+                sentByUserId: req.account.id,
+                sentByName: req.account.name,
+            });
+        }
+        catch (err) {
+            console.warn('[WhatsApp log] insert failed:', err instanceof Error ? err.message : err);
+        }
         results.push({
             customerId,
             phone,
             customerName,
             ok: sent.ok,
             error: sent.ok ? undefined : sent.error,
+            messageId: sent.ok ? (sent.messageId || sent.wamid) : undefined,
         });
     }
     const sent = results.filter((r) => r.ok).length;
@@ -1714,7 +1942,171 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
 app.get('/api/payment-reminders/status', requireShopkeeper, (_req, res) => {
     res.json({
         configured: isPaymentReminderWhatsAppConfigured(),
+        unitCostInr: whatsappMessageUnitCost(),
     });
+});
+
+/** —— WhatsApp API manager (AiSensy / Meta WABA) —— */
+app.get('/api/whatsapp/config', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ config: await getWhatsAppConfig(state.appId) });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load WhatsApp config' });
+    }
+});
+app.put('/api/whatsapp/config', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const result = await saveWhatsAppConfig(state.appId, req.body || {});
+        res.json(result);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save WhatsApp config' });
+    }
+});
+app.get('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ templates: await listWhatsAppTemplates(state.appId) });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load templates' });
+    }
+});
+app.post('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const template = await createWhatsAppTemplate(state.appId, req.body || {});
+        res.status(201).json({ template });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not create template' });
+    }
+});
+app.put('/api/whatsapp/templates/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const template = await updateWhatsAppTemplate(state.appId, req.params.id, req.body || {});
+        res.json({ template });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not update template' });
+    }
+});
+app.delete('/api/whatsapp/templates/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        await deleteWhatsAppTemplate(state.appId, req.params.id);
+        res.json({ ok: true });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not delete template' });
+    }
+});
+app.get('/api/whatsapp/campaigns', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ campaigns: await listWhatsAppCampaigns(state.appId) });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load campaigns' });
+    }
+});
+app.post('/api/whatsapp/campaigns', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const campaign = await createWhatsAppCampaign(state.appId, req.body || {});
+        res.status(201).json({ campaign });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not create campaign' });
+    }
+});
+app.put('/api/whatsapp/campaigns/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const campaign = await updateWhatsAppCampaign(state.appId, req.params.id, req.body || {});
+        res.json({ campaign });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not update campaign' });
+    }
+});
+app.delete('/api/whatsapp/campaigns/:id', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        await deleteWhatsAppCampaign(state.appId, req.params.id);
+        res.json({ ok: true });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not delete campaign' });
+    }
+});
+app.post('/api/whatsapp/campaigns/:id/send', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const result = await sendWhatsAppCampaignMessage(state.appId, req.account, {
+            campaignId: req.params.id,
+            phone: req.body?.phone,
+            userName: req.body?.userName || req.body?.customerName,
+            customerId: req.body?.customerId,
+            templateParams: req.body?.templateParams,
+        });
+        res.json({ ok: true, result });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not send campaign' });
+    }
+});
+app.get('/api/whatsapp/chats', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ chats: await listWhatsAppChats(state.appId) });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load chats' });
+    }
+});
+app.get('/api/whatsapp/chats/:phone', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ messages: await listWhatsAppChatMessages(state.appId, req.params.phone) });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load chat' });
+    }
+});
+
+/** Shop WhatsApp API send report (payment reminders, etc.). */
+app.get('/api/whatsapp-messages', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    if (!state.appId) {
+        res.status(400).json({ error: 'Complete shop setup first' });
+        return;
+    }
+    const fromRaw = String(req.query.from ?? '').trim();
+    const toRaw = String(req.query.to ?? '').trim();
+    const from = fromRaw ? new Date(fromRaw) : undefined;
+    const to = toRaw ? new Date(toRaw) : undefined;
+    try {
+        const messages = await listWhatsAppMessageLogs(state.appId, {
+            from: from && !Number.isNaN(from.getTime()) ? from : undefined,
+            to: to && !Number.isNaN(to.getTime()) ? to : undefined,
+        });
+        res.json({
+            messages,
+            summary: summarizeWhatsAppLogs(messages),
+            unitCostInr: whatsappMessageUnitCost(),
+        });
+    }
+    catch (err) {
+        console.error('[WhatsApp report]', err);
+        res.status(500).json({
+            error: err instanceof Error ? err.message : 'Could not load WhatsApp message report',
+        });
+    }
 });
 app.post('/api/todos/reminders/ack', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
@@ -1797,7 +2189,7 @@ app.post('/api/transactions', requireShopkeeper, (req, res) => {
     }
     const note = String(remarks ?? '').trim();
     let resolvedCategory = category ?? (type === 'receipt' ? 'receipt' : 'payment');
-    const serviceLookup = resolveService(state, resolvedCategory === 'sales' ? serviceId : null);
+    const serviceLookup = resolveService(state, resolvedCategory === 'sales' || resolvedCategory === 'purchase' ? serviceId : null);
     if (!serviceLookup.ok) {
         res.status(404).json({ error: serviceLookup.error });
         return;
@@ -1910,8 +2302,8 @@ app.post('/api/transactions', requireShopkeeper, (req, res) => {
         attachmentPath: savedAttachmentPath,
         recurringBillingId: null,
         recurringOccurrenceDate: null,
-        serviceId: resolvedCategory === 'sales' ? (serviceLookup.service?.id ?? null) : null,
-        serviceName: resolvedCategory === 'sales' ? (serviceLookup.service?.name ?? null) : null,
+        serviceId: resolvedCategory === 'sales' || resolvedCategory === 'purchase' ? (serviceLookup.service?.id ?? null) : null,
+        serviceName: resolvedCategory === 'sales' || resolvedCategory === 'purchase' ? (serviceLookup.service?.name ?? null) : null,
         createdAt: txCreatedAt,
     };
     state.transactions.unshift(tx);
@@ -1953,7 +2345,7 @@ app.put('/api/transactions/:id', requireShopkeeper, (req, res) => {
     }
     const note = remarks !== undefined ? String(remarks).trim() : existing.remarks;
     let resolvedCategory = category ?? existing.category ?? (nextType === 'receipt' ? 'receipt' : 'payment');
-    const serviceLookup = resolveService(state, resolvedCategory === 'sales'
+    const serviceLookup = resolveService(state, resolvedCategory === 'sales' || resolvedCategory === 'purchase'
         ? serviceId === undefined
             ? existing.serviceId
             : serviceId
@@ -2080,8 +2472,8 @@ app.put('/api/transactions/:id', requireShopkeeper, (req, res) => {
         cashAccountName: resolvedCashName,
         attachmentName: nextAttachmentName,
         attachmentPath: nextAttachmentPath,
-        serviceId: resolvedCategory === 'sales' ? (serviceLookup.service?.id ?? null) : null,
-        serviceName: resolvedCategory === 'sales' ? (serviceLookup.service?.name ?? null) : null,
+        serviceId: resolvedCategory === 'sales' || resolvedCategory === 'purchase' ? (serviceLookup.service?.id ?? null) : null,
+        serviceName: resolvedCategory === 'sales' || resolvedCategory === 'purchase' ? (serviceLookup.service?.name ?? null) : null,
         createdAt: nextCreatedAt,
     };
     state.transactions[index] = updated;

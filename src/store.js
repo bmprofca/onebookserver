@@ -272,15 +272,27 @@ function normalizeState(raw) {
         recurringOccurrenceDate: tx.recurringOccurrenceDate ?? null,
         serviceId: tx.serviceId ?? null,
         serviceName: tx.serviceName ?? null,
+        loanId: tx.loanId ?? null,
+        loanInstallmentId: tx.loanInstallmentId ?? null,
     }));
     raw.recurringBillings = (raw.recurringBillings ?? []).map((billing) => {
-        const legacy = !Number(billing.billingDelayDays);
+        // Delay 0 is valid (same-day bill). Only missing/non-numeric counts as legacy.
+        const rawDelay = billing.billingDelayDays;
+        const legacy =
+            rawDelay === undefined ||
+            rawDelay === null ||
+            rawDelay === '' ||
+            !Number.isFinite(Number(rawDelay));
         const effectiveDate = legacy
             ? normalizeLegacyPeriod(billing.effectiveDate, billing.interval)
             : billing.effectiveDate;
-        const nextPeriodStartDate = legacy
+        let nextPeriodStartDate = legacy
             ? normalizeLegacyPeriod(billing.nextRunDate, billing.interval)
             : (billing.nextPeriodStartDate ?? effectiveDate);
+        const billingDelayDays = legacy ? 1 : Number(rawDelay);
+        const nextRunDate = legacy
+            ? legacyBillingDate(nextPeriodStartDate, billing.interval)
+            : billing.nextRunDate;
         return {
             ...billing,
             customerPhone: billing.customerPhone ?? '',
@@ -290,13 +302,12 @@ function normalizeState(raw) {
             effectiveDate,
             nextPeriodStartDate,
             lastPeriodStartDate: billing.lastPeriodStartDate ?? null,
-            billingDelayDays: legacy ? 1 : Number(billing.billingDelayDays),
-            nextRunDate: legacy
-                ? legacyBillingDate(nextPeriodStartDate, billing.interval)
-                : billing.nextRunDate,
+            billingDelayDays,
+            nextRunDate,
             lastRunDate: billing.lastRunDate ?? null,
             autoBilling: billing.autoBilling ?? true,
             active: billing.active ?? true,
+            stopDate: billing.stopDate ?? null,
         };
     });
     raw.services = (raw.services ?? []).map((service) => ({
@@ -511,8 +522,8 @@ async function persistShop(state, ownerUserId) {
            cash_account_id, cash_account_name,
            attachment_name, attachment_path,
            recurring_billing_id, recurring_occurrence_date,
-           service_id, service_name, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+           service_id, service_name, loan_id, loan_installment_id, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 t.id,
                 appId,
                 t.type,
@@ -540,6 +551,8 @@ async function persistShop(state, ownerUserId) {
                 t.recurringOccurrenceDate ?? null,
                 t.serviceId ?? null,
                 t.serviceName ?? null,
+                t.loanId ?? null,
+                t.loanInstallmentId ?? null,
                 toMysqlDate(t.createdAt),
             ]);
         }
@@ -549,9 +562,9 @@ async function persistShop(state, ownerUserId) {
           (id, shop_app_id, customer_user_id, customer_name, customer_phone,
            amount, remarks, service_id, service_name, transaction_category,
            billing_interval, effective_date, next_period_start_date, last_period_start_date,
-           billing_delay_days, next_run_date, last_run_date, auto_billing, active,
+           billing_delay_days, next_run_date, last_run_date, auto_billing, active, stop_date,
            created_by_user_id, created_by_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 billing.id,
                 appId,
                 billing.customerId,
@@ -571,6 +584,7 @@ async function persistShop(state, ownerUserId) {
                 billing.lastRunDate,
                 billing.autoBilling ? 1 : 0,
                 billing.active ? 1 : 0,
+                billing.stopDate ?? null,
                 billing.createdByUserId,
                 billing.createdByName,
                 toMysqlDate(billing.createdAt),
@@ -794,6 +808,8 @@ async function loadShopFromDb(appId) {
                 : fromMysqlDateOnly(t.recurring_occurrence_date),
             serviceId: t.service_id == null ? null : String(t.service_id),
             serviceName: t.service_name == null ? null : String(t.service_name),
+            loanId: t.loan_id == null ? null : String(t.loan_id),
+            loanInstallmentId: t.loan_installment_id == null ? null : String(t.loan_installment_id),
             createdAt: fromMysqlDate(t.created_at),
         })),
         recurringBillings: recurringRows.map((billing) => ({
@@ -821,6 +837,7 @@ async function loadShopFromDb(appId) {
                 : fromMysqlDateOnly(billing.last_run_date),
             autoBilling: Boolean(billing.auto_billing),
             active: Boolean(billing.active),
+            stopDate: billing.stop_date == null ? null : fromMysqlDateOnly(billing.stop_date),
             createdByUserId: String(billing.created_by_user_id),
             createdByName: String(billing.created_by_name),
             createdAt: fromMysqlDate(billing.created_at),
@@ -1173,6 +1190,62 @@ export async function phoneExistsInDatabase(phone, excludeUserId) {
         ? await getPool().query('SELECT id FROM users WHERE phone = ? AND id <> ? LIMIT 1', [normalized, excludeUserId])
         : await getPool().query('SELECT id FROM users WHERE phone = ? LIMIT 1', [normalized]);
     return rows.length > 0;
+}
+
+/** True if this mobile is already a member of this shop. */
+export async function phoneExistsInShop(phone, shopAppId, excludeUserId) {
+    const normalized = normalizePhone(phone);
+    if (!/^\d{10}$/.test(normalized) || !shopAppId)
+        return false;
+    const [rows] = excludeUserId
+        ? await getPool().query(
+            'SELECT id FROM users WHERE phone = ? AND shop_app_id = ? AND id <> ? LIMIT 1',
+            [normalized, shopAppId, excludeUserId],
+        )
+        : await getPool().query(
+            'SELECT id FROM users WHERE phone = ? AND shop_app_id = ? LIMIT 1',
+            [normalized, shopAppId],
+        );
+    return rows.length > 0;
+}
+
+/** All auth accounts for a phone (owner shops + customer memberships). */
+export function accountsForPhone(phone) {
+    const normalized = normalizePhone(phone);
+    return loadAuth().accounts.filter((a) => normalizePhone(a.phone) === normalized);
+}
+
+/** Public profile cards for the profile picker. */
+export function profilesForPhone(phone) {
+    return accountsForPhone(phone).map((account) => {
+        let shopName = account.role === 'shopkeeper' ? 'My business' : 'Shop';
+        let shopAddress = '';
+        let setupComplete = false;
+        try {
+            const state = account.shopAppId
+                ? getShopByAppId(account.shopAppId)
+                : account.role === 'shopkeeper'
+                    ? ensureShopkeeperDraft(account)
+                    : null;
+            if (state) {
+                shopName = state.shopName || shopName;
+                shopAddress = state.shopAddress ?? '';
+                setupComplete = Boolean(state.setupComplete);
+            }
+        }
+        catch {
+            // keep defaults
+        }
+        return {
+            id: account.id,
+            name: account.name,
+            role: account.role,
+            shopAppId: account.shopAppId,
+            shopName,
+            shopAddress,
+            setupComplete,
+        };
+    });
 }
 /** 6-digit OTP. Uses crypto when available; falls back for very old runtimes. */
 export function generateOtp() {

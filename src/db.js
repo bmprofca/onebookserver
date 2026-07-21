@@ -66,11 +66,42 @@ async function ensureSchema() {
       phone_verified TINYINT(1) NOT NULL DEFAULT 0,
       shop_app_id VARCHAR(32) NULL COMMENT 'Shop this user belongs to / owns',
       created_at DATETIME(3) NOT NULL,
-      UNIQUE KEY uq_users_phone (phone),
+      UNIQUE KEY uq_users_phone_shop (phone, shop_app_id),
+      KEY idx_users_phone (phone),
       KEY idx_users_shop (shop_app_id),
       KEY idx_users_role (role)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+    // Allow one phone across multiple shops / roles (was global UNIQUE phone)
+    try {
+        await p.query('ALTER TABLE users DROP INDEX uq_users_phone');
+        console.log('[MySQL] Dropped global unique phone index (multi-profile enabled)');
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/check that it exists|Can't DROP|Unknown key/i.test(msg)) {
+            console.warn('[MySQL] drop uq_users_phone skipped:', msg);
+        }
+    }
+    try {
+        await p.query('ALTER TABLE users ADD UNIQUE KEY uq_users_phone_shop (phone, shop_app_id)');
+        console.log('[MySQL] Added unique (phone, shop_app_id) for multi-profile');
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate key name|already exists/i.test(msg)) {
+            console.warn('[MySQL] uq_users_phone_shop migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query('ALTER TABLE users ADD KEY idx_users_phone (phone)');
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate key name|already exists/i.test(msg)) {
+            console.warn('[MySQL] idx_users_phone migrate skipped:', msg);
+        }
+    }
     await p.query(`
     CREATE TABLE IF NOT EXISTS shops (
       app_id VARCHAR(32) NOT NULL PRIMARY KEY,
@@ -344,6 +375,7 @@ async function ensureSchema() {
         `ADD COLUMN last_period_start_date DATE NULL AFTER next_period_start_date`,
         `ADD COLUMN billing_delay_days INT NOT NULL DEFAULT 0 AFTER last_period_start_date`,
         `ADD COLUMN auto_billing TINYINT(1) NOT NULL DEFAULT 1 AFTER last_run_date`,
+        `ADD COLUMN stop_date DATE NULL AFTER active`,
     ]) {
         try {
             await p.query(`ALTER TABLE recurring_billings ${column}`);
@@ -449,6 +481,194 @@ async function ensureSchema() {
       closed_at DATETIME(3) NOT NULL,
       closed_by VARCHAR(120) NOT NULL,
       KEY idx_day_shop (shop_app_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_message_logs (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      shop_app_id VARCHAR(32) NOT NULL,
+      customer_user_id CHAR(36) NULL,
+      customer_name VARCHAR(180) NOT NULL,
+      phone VARCHAR(20) NOT NULL,
+      kind VARCHAR(40) NOT NULL,
+      template_name VARCHAR(120) NOT NULL,
+      message_body TEXT NOT NULL,
+      status VARCHAR(20) NOT NULL,
+      error_message VARCHAR(500) NULL,
+      provider_message_id VARCHAR(120) NULL,
+      cost_inr DECIMAL(10,4) NOT NULL DEFAULT 0,
+      sent_by_user_id CHAR(36) NULL,
+      sent_by_name VARCHAR(120) NULL,
+      created_at DATETIME(3) NOT NULL,
+      KEY idx_wa_shop_created (shop_app_id, created_at),
+      KEY idx_wa_shop_status (shop_app_id, status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS shop_whatsapp_config (
+      shop_app_id VARCHAR(32) NOT NULL PRIMARY KEY,
+      provider VARCHAR(40) NOT NULL DEFAULT 'aisensy',
+      api_key VARCHAR(500) NULL,
+      project_name VARCHAR(160) NOT NULL DEFAULT '',
+      project_id VARCHAR(120) NULL,
+      waba_id VARCHAR(120) NULL,
+      phone_number_id VARCHAR(120) NULL,
+      country_code VARCHAR(8) NOT NULL DEFAULT '91',
+      connected TINYINT(1) NOT NULL DEFAULT 0,
+      created_at DATETIME(3) NOT NULL,
+      updated_at DATETIME(3) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS shop_whatsapp_templates (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      shop_app_id VARCHAR(32) NOT NULL,
+      name VARCHAR(120) NOT NULL,
+      category VARCHAR(40) NOT NULL DEFAULT 'UTILITY',
+      language VARCHAR(20) NOT NULL DEFAULT 'en',
+      body_text TEXT NOT NULL,
+      campaign_name VARCHAR(160) NOT NULL,
+      param_labels TEXT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft',
+      created_at DATETIME(3) NOT NULL,
+      updated_at DATETIME(3) NOT NULL,
+      KEY idx_wa_tpl_shop (shop_app_id, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS shop_whatsapp_campaigns (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      shop_app_id VARCHAR(32) NOT NULL,
+      name VARCHAR(160) NOT NULL,
+      template_id CHAR(36) NULL,
+      campaign_name VARCHAR(160) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft',
+      last_sent_at DATETIME(3) NULL,
+      created_at DATETIME(3) NOT NULL,
+      updated_at DATETIME(3) NOT NULL,
+      KEY idx_wa_camp_shop (shop_app_id, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+    for (const column of [
+        `ADD COLUMN loan_id CHAR(36) NULL AFTER service_name`,
+        `ADD COLUMN loan_installment_id CHAR(36) NULL AFTER loan_id`,
+    ]) {
+        try {
+            await p.query(`ALTER TABLE transactions ${column}`);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/Duplicate column/i.test(msg)) {
+                console.warn('[MySQL] loan transaction column migrate skipped:', msg);
+            }
+        }
+    }
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS customer_loans (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      loan_no VARCHAR(32) NULL,
+      shop_app_id VARCHAR(32) NOT NULL,
+      customer_user_id CHAR(36) NOT NULL,
+      customer_name VARCHAR(120) NOT NULL,
+      customer_phone VARCHAR(15) NOT NULL DEFAULT '',
+      principal DECIMAL(14,2) NOT NULL,
+      outstanding_principal DECIMAL(14,2) NOT NULL,
+      interest_rate DECIMAL(8,4) NOT NULL,
+      tenure_months INT NOT NULL,
+      emi_amount DECIMAL(14,2) NOT NULL,
+      start_date DATE NOT NULL,
+      emi_start_date DATE NULL,
+      next_due_date DATE NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'active',
+      remarks VARCHAR(500) NOT NULL DEFAULT '',
+      disbursement_tx_id CHAR(36) NULL,
+      closed_at DATETIME(3) NULL,
+      preclosure_charge DECIMAL(14,2) NOT NULL DEFAULT 0,
+      created_by_user_id CHAR(36) NOT NULL,
+      created_by_name VARCHAR(120) NOT NULL,
+      created_at DATETIME(3) NOT NULL,
+      updated_at DATETIME(3) NOT NULL,
+      KEY idx_loans_shop (shop_app_id),
+      KEY idx_loans_customer (shop_app_id, customer_user_id),
+      KEY idx_loans_status (shop_app_id, status, next_due_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN emi_start_date DATE NULL AFTER start_date
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] emi_start_date migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      UPDATE customer_loans
+      SET emi_start_date = start_date
+      WHERE emi_start_date IS NULL
+    `);
+    }
+    catch (err) {
+        console.warn('[MySQL] emi_start_date backfill skipped:', err instanceof Error ? err.message : err);
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN loan_no VARCHAR(32) NULL AFTER id
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] loan_no migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      UPDATE customer_loans
+      SET loan_no = CONCAT('LN', UPPER(SUBSTRING(REPLACE(id, '-', ''), 1, 8)))
+      WHERE loan_no IS NULL OR loan_no = ''
+    `);
+    }
+    catch (err) {
+        console.warn('[MySQL] loan_no backfill skipped:', err instanceof Error ? err.message : err);
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD UNIQUE KEY uq_loans_shop_no (shop_app_id, loan_no)
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate|exists/i.test(msg)) {
+            console.warn('[MySQL] loan_no unique migrate skipped:', msg);
+        }
+    }
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS loan_installments (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      loan_id CHAR(36) NOT NULL,
+      installment_no INT NOT NULL,
+      due_date DATE NOT NULL,
+      principal_component DECIMAL(14,2) NOT NULL,
+      interest_component DECIMAL(14,2) NOT NULL,
+      emi_amount DECIMAL(14,2) NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'pending',
+      posted_tx_id CHAR(36) NULL,
+      paid_tx_id CHAR(36) NULL,
+      paid_at DATETIME(3) NULL,
+      UNIQUE KEY uq_loan_installment (loan_id, installment_no),
+      KEY idx_loan_inst_due (loan_id, status, due_date),
+      KEY idx_loan_inst_due_date (due_date, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
     console.log('[MySQL] Schema ready (users, shops, cash_accounts, bank_accounts, transactions, …)');

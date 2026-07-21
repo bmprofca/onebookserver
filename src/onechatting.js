@@ -6,6 +6,10 @@
 const DEFAULT_BASE_URL = 'https://server.onechatting.com'
 const DEFAULT_COUNTRY_CODE = '91'
 
+export function oneChattingBaseUrl() {
+  return (process.env.ONECHATTING_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '')
+}
+
 export function isWhatsAppOtpConfigured() {
   return Boolean(
     process.env.ONECHATTING_TOKEN?.trim() && process.env.ONECHATTING_OTP_TEMPLATE_ID?.trim(),
@@ -52,6 +56,55 @@ async function listApprovedTemplates(baseUrl, token, category) {
   return data.data ?? []
 }
 
+/** Verify a shop OneChatting developer token against Meta-backed template list. */
+export async function probeOneChattingToken(token) {
+  const key = String(token || '').trim()
+  if (!key) return { ok: false, error: 'OneChatting token is required' }
+  if (key.length < 12) return { ok: false, error: 'Token looks too short' }
+  try {
+    const templates = await listApprovedTemplates(oneChattingBaseUrl(), key, 'UTILITY')
+    return {
+      ok: true,
+      message:
+        Array.isArray(templates) && templates.length
+          ? `Connected · ${templates.length} approved utility template${templates.length === 1 ? '' : 's'}`
+          : 'Connected to OneChatting (Meta)',
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : 'Could not verify OneChatting token',
+    }
+  }
+}
+
+/**
+ * Send a template using an explicit OneChatting token (shop connection).
+ */
+export async function sendOneChattingTemplate({
+  token,
+  phone10,
+  templateRef,
+  bodyTexts = [],
+  categories = ['UTILITY', 'MARKETING', 'AUTHENTICATION'],
+  countryCode = DEFAULT_COUNTRY_CODE,
+  headerImageUrl = null,
+}) {
+  const result = await sendTemplateMessage(
+    phone10,
+    templateRef,
+    bodyTexts,
+    categories,
+    { token, countryCode, headerImageUrl },
+  )
+  if (!result.ok) throw new Error(result.error || 'OneChatting send failed')
+  return {
+    ok: true,
+    providerMessageId: result.messageId || result.wamid || null,
+    raw: result,
+  }
+}
+
 async function resolveTemplate(baseUrl, token, templateRef, categories) {
   for (const category of categories) {
     const templates = await listApprovedTemplates(baseUrl, token, category)
@@ -86,8 +139,8 @@ function headerImageFromTemplate(templateRow) {
  * @param {{ headerImageUrl?: string | null }} [options]
  */
 async function sendTemplateMessage(phone10, templateRef, bodyTexts, categories, options = {}) {
-  const token = process.env.ONECHATTING_TOKEN?.trim()
-  const baseUrl = (process.env.ONECHATTING_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '')
+  const token = String(options.token || process.env.ONECHATTING_TOKEN || '').trim()
+  const baseUrl = oneChattingBaseUrl()
   if (!token || !templateRef) {
     return {
       ok: false,
@@ -100,7 +153,7 @@ async function sendTemplateMessage(phone10, templateRef, bodyTexts, categories, 
     return { ok: false, error: 'Customer mobile must be a 10-digit Indian number' }
   }
 
-  const number = toWhatsAppNumber(digits)
+  const number = toWhatsAppNumber(digits, options.countryCode || DEFAULT_COUNTRY_CODE)
   const url = `${baseUrl}/developer/message/send-template`
 
   try {
@@ -234,7 +287,18 @@ export async function sendPaymentReminderWhatsApp(payload) {
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
   const bodyTexts = order.map((key) => values[key] ?? '')
-  return sendTemplateMessage(payload.phone, templateRef, bodyTexts, ['UTILITY', 'MARKETING'], {
+  const messageBody = [
+    `Dear ${values.name},`,
+    `Kindly clear your due of Rs. ${values.amount} to ${values.shop} as soon as possible.`,
+    `Thanks and Regards`,
+    `Team ${values.team}`,
+  ].join('\n')
+  const result = await sendTemplateMessage(payload.phone, templateRef, bodyTexts, ['UTILITY', 'MARKETING'], {
     headerImageUrl: process.env.ONECHATTING_PAYMENT_REMINDER_HEADER_IMAGE?.trim() || null,
   })
+  return {
+    ...result,
+    templateName: templateRef,
+    messageBody,
+  }
 }
