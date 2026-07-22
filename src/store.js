@@ -380,6 +380,12 @@ export function toOpeningBalance(value) {
         return 0;
     return Math.round(n * 100) / 100;
 }
+
+/** Durable write of customer opening balance (source of truth in users table). */
+export async function writeCustomerOpeningBalance(userId, openingBalance) {
+    const bal = toOpeningBalance(openingBalance);
+    await getPool().query('UPDATE users SET opening_balance = ? WHERE id = ?', [bal, userId]);
+}
 function toMysqlDate(iso) {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime()))
@@ -419,7 +425,7 @@ async function persistAuth(auth) {
         await conn.query('DELETE FROM otps');
         await conn.query('DELETE FROM pending_registrations');
 
-        // Resolve latest opening balances before any rewrite.
+        // Resolve opening balances: DB first, then shop cache only when explicitly set.
         const openingById = new Map();
         const [balRows] = await conn.query('SELECT id, opening_balance FROM users');
         for (const r of balRows) {
@@ -427,11 +433,13 @@ async function persistAuth(auth) {
         }
         for (const shop of shopCaches.values()) {
             for (const u of shop.users ?? []) {
+                if (u.openingBalance === undefined || u.openingBalance === null)
+                    continue;
                 openingById.set(String(u.id), toOpeningBalance(u.openingBalance));
             }
         }
 
-        // Upsert first (keeps opening_balance), then delete orphans — never blank-wipe.
+        // Upsert first, then delete orphans — never blank-wipe.
         // Keep auth login accounts AND any shop member rows (customers may not all be in auth).
         const keepIdSet = new Set();
         for (const a of auth.accounts) {
@@ -445,6 +453,7 @@ async function persistAuth(auth) {
         const keepIds = [...keepIdSet];
         for (const a of auth.accounts) {
             const id = String(a.id);
+            // Do NOT update opening_balance here — persistShop / writeCustomerOpeningBalance own it.
             await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
@@ -453,8 +462,7 @@ async function persistAuth(auth) {
            email = VALUES(email),
            role = VALUES(role),
            phone_verified = VALUES(phone_verified),
-           shop_app_id = VALUES(shop_app_id),
-           opening_balance = VALUES(opening_balance)`, [
+           shop_app_id = VALUES(shop_app_id)`, [
                 id,
                 a.name,
                 a.phone,
