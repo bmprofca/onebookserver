@@ -265,6 +265,7 @@ function normalizeState(raw) {
         phone: u.phone ?? '',
         email: u.email ?? null,
         role: u.role ?? 'shopkeeper',
+        openingBalance: Number(u.openingBalance) || 0,
     }));
     raw.transactions = (raw.transactions ?? []).map((tx) => ({
         ...tx,
