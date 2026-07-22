@@ -65,6 +65,7 @@ async function ensureSchema() {
       role ENUM('shopkeeper','customer') NOT NULL,
       phone_verified TINYINT(1) NOT NULL DEFAULT 0,
       shop_app_id VARCHAR(32) NULL COMMENT 'Shop this user belongs to / owns',
+      opening_balance DECIMAL(14,2) NOT NULL DEFAULT 0 COMMENT 'Signed: +receivable / -payable for customers',
       created_at DATETIME(3) NOT NULL,
       UNIQUE KEY uq_users_phone_shop (phone, shop_app_id),
       KEY idx_users_phone (phone),
@@ -100,6 +101,21 @@ async function ensureSchema() {
         const msg = err instanceof Error ? err.message : String(err);
         if (!/Duplicate key name|already exists/i.test(msg)) {
             console.warn('[MySQL] idx_users_phone migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE users
+        ADD COLUMN opening_balance DECIMAL(14,2) NOT NULL DEFAULT 0
+          COMMENT 'Signed: +receivable / -payable for customers'
+          AFTER shop_app_id
+    `);
+        console.log('[MySQL] Added users.opening_balance');
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] users.opening_balance migrate skipped:', msg);
         }
     }
     await p.query(`

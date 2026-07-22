@@ -89,6 +89,35 @@ function toDeliveryChannel(sent) {
         return 'whatsapp';
     return 'demo';
 }
+
+/**
+ * Parse customer opening balance from request body.
+ * Accepts either signed `openingBalance`, or `openingAmount` + `openingSide`
+ * (`receivable` | `payable`). Returns null when invalid.
+ */
+function parseCustomerOpeningBalance(body) {
+    if (body?.openingAmount !== undefined || body?.openingSide !== undefined) {
+        const raw = String(body.openingAmount ?? '').trim();
+        if (!raw || raw === '0' || raw === '0.0' || raw === '0.00')
+            return 0;
+        const amount = Number(raw);
+        if (!Number.isFinite(amount) || amount < 0 || amount > 999999999)
+            return null;
+        const side = String(body.openingSide ?? 'receivable').toLowerCase();
+        if (side === 'payable')
+            return -Math.abs(amount);
+        if (side === 'receivable')
+            return Math.abs(amount);
+        return null;
+    }
+    if (body?.openingBalance === undefined || body?.openingBalance === null || body?.openingBalance === '')
+        return 0;
+    const signed = Number(body.openingBalance);
+    if (!Number.isFinite(signed) || Math.abs(signed) > 999999999)
+        return null;
+    return Math.round(signed * 100) / 100;
+}
+
 function otpSentMessage(channel, purpose) {
     if (purpose === 'register') {
         if (channel === 'whatsapp+sms') {
@@ -936,6 +965,12 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
         .trim()
         .toLowerCase();
     const role = String(req.body?.role ?? 'customer') || 'customer';
+    /** Signed opening: +receivable (they owe you), −payable (you owe them). */
+    const openingBalance = parseCustomerOpeningBalance(req.body);
+    if (openingBalance === null) {
+        res.status(400).json({ error: 'Invalid opening balance' });
+        return;
+    }
     if (!name) {
         res.status(400).json({ error: 'Name is required' });
         return;
@@ -993,6 +1028,7 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
         phone,
         email: email || null,
         role,
+        openingBalance: role === 'customer' ? openingBalance : 0,
         createdAt,
     };
     state.users.push(user);
@@ -1059,6 +1095,11 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
     const email = String(req.body?.email ?? '')
         .trim()
         .toLowerCase();
+    const openingBalance = parseCustomerOpeningBalance(req.body);
+    if (openingBalance === null) {
+        res.status(400).json({ error: 'Invalid opening balance' });
+        return;
+    }
     if (!name || name.length < 2) {
         res.status(400).json({ error: 'Enter a valid name' });
         return;
@@ -1108,6 +1149,7 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
         name,
         phone,
         email: email || null,
+        openingBalance,
     };
     state.users[idx] = updated;
     state.transactions = state.transactions.map((t) => {

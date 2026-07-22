@@ -408,11 +408,16 @@ async function persistAuth(auth) {
         await conn.query('DELETE FROM sessions');
         await conn.query('DELETE FROM otps');
         await conn.query('DELETE FROM pending_registrations');
-        // Upsert users (do not wipe — shops may reference them). Replace by full sync:
+        // Upsert users (do not wipe opening_balance — that lives on shop member rows).
+        const [balRows] = await conn.query('SELECT id, opening_balance FROM users');
+        const openingById = new Map();
+        for (const r of balRows) {
+            openingById.set(String(r.id), Number(r.opening_balance) || 0);
+        }
         await conn.query('DELETE FROM users');
         for (const a of auth.accounts) {
-            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [
+            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 a.id,
                 a.name,
                 a.phone,
@@ -420,6 +425,7 @@ async function persistAuth(auth) {
                 a.role,
                 a.phoneVerified ? 1 : 0,
                 a.shopAppId,
+                openingById.get(a.id) ?? 0,
                 toMysqlDate(a.createdAt),
             ]);
         }
@@ -658,19 +664,21 @@ async function persistShop(state, ownerUserId) {
         // Keep global auth accounts as the login source; shop.users mirrors for UI.
         // Ensure each shop user has a users row with this shop_app_id when they login via auth.
         for (const u of state.users) {
-            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, created_at)
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
+         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
            email = VALUES(email),
            role = VALUES(role),
-           shop_app_id = VALUES(shop_app_id)`, [
+           shop_app_id = VALUES(shop_app_id),
+           opening_balance = VALUES(opening_balance)`, [
                 u.id,
                 u.name,
                 u.phone,
                 u.email ?? null,
                 u.role,
                 appId,
+                Number(u.openingBalance) || 0,
                 toMysqlDate(u.createdAt),
             ]);
         }
@@ -784,6 +792,7 @@ async function loadShopFromDb(appId) {
             phone: String(u.phone),
             email: u.email == null ? null : String(u.email),
             role: u.role,
+            openingBalance: Number(u.opening_balance) || 0,
             createdAt: fromMysqlDate(u.created_at),
         })),
         cashAccounts,

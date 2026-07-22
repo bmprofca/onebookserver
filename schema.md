@@ -8,3 +8,4 @@
 -- transactions.customer_user_id links a tx to a customer user
 
 -- See server/src/db.js ensureSchema() for the live CREATE TABLE statements.
+-- users.opening_balance: signed DECIMAL — +receivable (customer owes shop), −payable (shop owes customer).
