@@ -415,6 +415,14 @@ async function persistAuth(auth) {
         for (const r of balRows) {
             openingById.set(String(r.id), Number(r.opening_balance) || 0);
         }
+        // Prefer in-memory shop state (latest edits) over DB snapshot.
+        for (const shop of shopCaches.values()) {
+            for (const u of shop.users ?? []) {
+                if (typeof u.openingBalance === 'number' && Number.isFinite(u.openingBalance)) {
+                    openingById.set(String(u.id), Number(u.openingBalance) || 0);
+                }
+            }
+        }
         await conn.query('DELETE FROM users');
         for (const a of auth.accounts) {
             await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
