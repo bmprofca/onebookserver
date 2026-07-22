@@ -1486,10 +1486,17 @@ app.post('/api/loans/preview', requireShopkeeper, (req, res) => {
         const principal = Number(req.body?.principal);
         const interestRate = Number(req.body?.interestRate);
         const tenureMonths = Math.round(Number(req.body?.tenureMonths));
+        const interestType = req.body?.interestType;
+        const emiFrequency = req.body?.emiFrequency;
         const emiStartDate = String(req.body?.emiStartDate || req.body?.startDate || localDateString());
-        const emiAmount = calculateEmi(principal, interestRate, tenureMonths);
-        const schedule = buildAmortizationSchedule(principal, interestRate, tenureMonths, emiStartDate);
-        res.json({ emiAmount, schedule });
+        const emiAmount = calculateEmi(principal, interestRate, tenureMonths, interestType, emiFrequency);
+        const schedule = buildAmortizationSchedule(principal, interestRate, tenureMonths, emiStartDate, interestType, emiFrequency);
+        res.json({
+            emiAmount,
+            schedule,
+            interestType: interestType === 'flat' ? 'flat' : 'reducing',
+            emiFrequency: emiFrequency === 'weekly' ? 'weekly' : 'monthly',
+        });
     }
     catch (err) {
         res.status(400).json({ error: err instanceof Error ? err.message : 'Invalid loan input' });
@@ -1533,10 +1540,13 @@ app.post('/api/customers/:customerId/loans', requireShopkeeper, async (req, res)
             customerId: req.params.customerId,
             principal: req.body?.principal,
             interestRate: req.body?.interestRate,
+            interestType: req.body?.interestType,
+            emiFrequency: req.body?.emiFrequency,
             tenureMonths: req.body?.tenureMonths,
             loanDate: req.body?.loanDate || req.body?.startDate,
             emiStartDate: req.body?.emiStartDate,
             cashAccountId: req.body?.cashAccountId,
+            downPayment: req.body?.downPayment,
             remarks: req.body?.remarks,
         });
         await materializeLoanEmis(state);
@@ -1574,6 +1584,8 @@ app.put('/api/loans/:id', requireShopkeeper, async (req, res) => {
         const detail = await updateCustomerLoan(state, req.params.id, {
             principal: req.body?.principal,
             interestRate: req.body?.interestRate,
+            interestType: req.body?.interestType,
+            emiFrequency: req.body?.emiFrequency,
             tenureMonths: req.body?.tenureMonths,
             loanDate: req.body?.loanDate || req.body?.startDate,
             emiStartDate: req.body?.emiStartDate,

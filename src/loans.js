@@ -5,7 +5,10 @@ import {
   buildAmortizationSchedule,
   calculateEmi,
   dateOnly,
+  defaultEmiStartDate,
   emiLedgerDate,
+  normalizeEmiFrequency,
+  normalizeInterestType,
   roundMoney,
 } from './loanMath.js'
 import { newTxId, uniqueTxCreatedAt } from './store.js'
@@ -38,7 +41,15 @@ function mapLoan(row) {
     customerPhone: String(row.customer_phone ?? ''),
     principal: Number(row.principal),
     outstandingPrincipal: Number(row.outstanding_principal),
+    downPayment: Number(row.down_payment || 0),
+    saleAmount: roundMoney(
+      Number(row.sale_amount != null && row.sale_amount !== ''
+        ? row.sale_amount
+        : Number(row.principal) + Number(row.down_payment || 0)),
+    ),
     interestRate: Number(row.interest_rate),
+    interestType: normalizeInterestType(row.interest_type),
+    emiFrequency: normalizeEmiFrequency(row.emi_frequency),
     tenureMonths: Number(row.tenure_months),
     emiAmount: Number(row.emi_amount),
     startDate,
@@ -48,6 +59,8 @@ function mapLoan(row) {
     status: String(row.status),
     remarks: String(row.remarks ?? ''),
     disbursementTxId: row.disbursement_tx_id == null ? null : String(row.disbursement_tx_id),
+    downPaymentTxId:
+      row.down_payment_tx_id == null ? null : String(row.down_payment_tx_id),
     closedAt: row.closed_at
       ? row.closed_at instanceof Date
         ? row.closed_at.toISOString()
@@ -67,14 +80,15 @@ function mapLoan(row) {
   }
 }
 
-function mapInstallment(row) {
+function mapInstallment(row, emiFrequency = 'monthly') {
   const dueDate = asDateOnly(row.due_date)
+  const freq = normalizeEmiFrequency(emiFrequency)
   return {
     id: String(row.id),
     loanId: String(row.loan_id),
     installmentNo: Number(row.installment_no),
     dueDate,
-    ledgerDate: dueDate ? emiLedgerDate(dueDate) : null,
+    ledgerDate: dueDate ? emiLedgerDate(dueDate, freq) : null,
     principalComponent: Number(row.principal_component),
     interestComponent: Number(row.interest_component),
     emiAmount: Number(row.emi_amount),
@@ -145,7 +159,7 @@ export async function getLoanWithSchedule(shopAppId, loanId) {
     `SELECT * FROM loan_installments WHERE loan_id = ? ORDER BY installment_no ASC`,
     [loanId],
   )
-  return { loan, installments: inst.map(mapInstallment) }
+  return { loan, installments: inst.map((row) => mapInstallment(row, loan.emiFrequency)) }
 }
 
 export async function createCustomerLoan(state, account, input) {
@@ -153,11 +167,21 @@ export async function createCustomerLoan(state, account, input) {
     (u) => u.id === input.customerId && u.role === 'customer',
   )
   if (!customer) throw new Error('Customer not found')
-  const principal = roundMoney(input.principal)
+  const saleAmount = roundMoney(input.principal)
+  const downPayment = roundMoney(Math.max(0, Number(input.downPayment) || 0))
+  if (!(saleAmount > 0)) throw new Error('Sale amount must be greater than 0')
+  if (downPayment >= saleAmount) {
+    throw new Error('Down payment must be less than the sale amount')
+  }
+  const principal = roundMoney(saleAmount - downPayment)
   const interestRate = Number(input.interestRate)
+  const interestType = normalizeInterestType(input.interestType)
+  const emiFrequency = normalizeEmiFrequency(input.emiFrequency)
   const tenureMonths = Math.round(Number(input.tenureMonths))
   const loanDate = String(input.loanDate || input.startDate || dateOnly())
-  const emiStartDate = String(input.emiStartDate || loanDate)
+  const emiStartDate = String(
+    input.emiStartDate || defaultEmiStartDate(loanDate, emiFrequency),
+  )
   if (!/^\d{4}-\d{2}-\d{2}$/.test(loanDate)) {
     throw new Error('Enter a valid loan date')
   }
@@ -167,12 +191,22 @@ export async function createCustomerLoan(state, account, input) {
   if (emiStartDate < loanDate) {
     throw new Error('EMI start date cannot be before loan date')
   }
-  const emiAmount = calculateEmi(principal, interestRate, tenureMonths)
+  if (!(principal > 0)) throw new Error('Financed amount must be greater than 0')
+
+  const emiAmount = calculateEmi(
+    principal,
+    interestRate,
+    tenureMonths,
+    interestType,
+    emiFrequency,
+  )
   const schedule = buildAmortizationSchedule(
     principal,
     interestRate,
     tenureMonths,
     emiStartDate,
+    interestType,
+    emiFrequency,
   )
   const loanId = randomUUID()
   let loanNo = newLoanNo(loanDate)
@@ -187,35 +221,65 @@ export async function createCustomerLoan(state, account, input) {
   }
   const now = new Date()
   const nextDueDate = schedule[0]?.dueDate ?? null
-  const remarks = String(input.remarks ?? '').trim() || 'Customer loan'
+  const remarks = String(input.remarks ?? '').trim() || 'Sale on EMI'
   const label = loanLabel(loanNo, remarks)
+  const rateLabel = interestType === 'flat' ? 'flat' : 'reducing'
+  const freqLabel = emiFrequency === 'weekly' ? 'weekly' : 'monthly'
 
-  // 1) Principal Out on customer ledger (loan date).
-  const cash = (state.cashAccounts ?? []).find((a) => a.id === input.cashAccountId)
-  if (!cash) throw new Error('Select a cash/bank account for disbursement')
+  const cash = input.cashAccountId
+    ? (state.cashAccounts ?? []).find((a) => a.id === input.cashAccountId)
+    : null
+  if (downPayment > 0 && !cash) {
+    throw new Error('Select cash/bank account for down payment receipt')
+  }
+
+  // 1) Full sale on customer ledger
   const disbursementTx = pushTx(state, {
     type: 'payment',
-    category: 'payment',
-    amount: principal,
-    remarks: `${label} · Principal Out`,
+    category: 'sales',
+    amount: saleAmount,
+    remarks: `${label} · Sale on EMI · ${freqLabel} · ${rateLabel} ${interestRate}% · ${tenureMonths} ${
+      emiFrequency === 'weekly' ? 'wk' : 'mo'
+    } · EMI ${emiAmount}${downPayment > 0 ? ` · DP ${downPayment}` : ''}`,
     userId: account.id,
     userName: account.name,
     customerId: customer.id,
     customerName: customer.name,
     customerPhone: customer.phone ?? '',
-    cashAccountId: cash.id,
-    cashAccountName: cash.name,
+    cashAccountId: null,
+    cashAccountName: null,
     loanId,
     createdAt: `${loanDate}T12:00:00`,
   })
 
+  // 2) Down payment as Receipt In (reduces customer due immediately)
+  let downPaymentTx = null
+  if (downPayment > 0) {
+    downPaymentTx = pushTx(state, {
+      type: 'receipt',
+      category: 'receipt',
+      amount: downPayment,
+      remarks: `${label} · Down payment · In`,
+      userId: account.id,
+      userName: account.name,
+      customerId: customer.id,
+      customerName: customer.name,
+      customerPhone: customer.phone ?? '',
+      cashAccountId: cash.id,
+      cashAccountName: cash.name,
+      loanId,
+      createdAt: `${loanDate}T12:00:01`,
+    })
+  }
+
   await getPool().query(
     `INSERT INTO customer_loans
       (id, loan_no, shop_app_id, customer_user_id, customer_name, customer_phone,
-       principal, outstanding_principal, interest_rate, tenure_months, emi_amount,
-       start_date, emi_start_date, next_due_date, status, remarks, disbursement_tx_id,
-       closed_at, preclosure_charge, created_by_user_id, created_by_name, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, NULL, 0, ?, ?, ?, ?)`,
+       principal, outstanding_principal, sale_amount, down_payment, interest_rate, interest_type,
+       emi_frequency, tenure_months, emi_amount, start_date, emi_start_date, next_due_date, status, remarks,
+       disbursement_tx_id, down_payment_tx_id, closed_at, preclosure_charge,
+       created_by_user_id, created_by_name, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, NULL, 0, ?, ?, ?, ?)`,
     [
       loanId,
       loanNo,
@@ -225,7 +289,11 @@ export async function createCustomerLoan(state, account, input) {
       customer.phone ?? '',
       principal,
       principal,
+      saleAmount,
+      downPayment,
       interestRate,
+      interestType,
+      emiFrequency,
       tenureMonths,
       emiAmount,
       loanDate,
@@ -233,6 +301,7 @@ export async function createCustomerLoan(state, account, input) {
       nextDueDate,
       remarks,
       disbursementTx?.id ?? null,
+      downPaymentTx?.id ?? null,
       account.id,
       account.name,
       now,
@@ -269,7 +338,7 @@ export async function materializeLoanEmis(state, today = dateOnly()) {
   if (!state.appId) return 0
   const [pendingRows] = await getPool().query(
     `SELECT i.*, l.customer_user_id, l.customer_name, l.customer_phone, l.remarks AS loan_remarks,
-            l.loan_no, l.shop_app_id, l.status AS loan_status
+            l.loan_no, l.shop_app_id, l.status AS loan_status, l.emi_frequency
      FROM loan_installments i
      INNER JOIN customer_loans l ON l.id = i.loan_id
      WHERE l.shop_app_id = ?
@@ -281,12 +350,14 @@ export async function materializeLoanEmis(state, today = dateOnly()) {
   const dueRows = pendingRows.filter((row) => {
     const dueDate = asDateOnly(row.due_date)
     if (!dueDate) return false
-    return emiLedgerDate(dueDate) <= today
+    const freq = normalizeEmiFrequency(row.emi_frequency)
+    return emiLedgerDate(dueDate, freq) <= today
   })
   let created = 0
   for (const row of dueRows) {
     const dueDate = asDateOnly(row.due_date)
-    const ledgerDate = dueDate ? emiLedgerDate(dueDate) : today
+    const freq = normalizeEmiFrequency(row.emi_frequency)
+    const ledgerDate = dueDate ? emiLedgerDate(dueDate, freq) : today
     const loanNo =
       row.loan_no == null || row.loan_no === ''
         ? `LN${String(row.loan_id).replace(/-/g, '').slice(0, 8).toUpperCase()}`
@@ -300,14 +371,13 @@ export async function materializeLoanEmis(state, today = dateOnly()) {
       const interest = roundMoney(row.interest_component)
       const principalPart = roundMoney(row.principal_component)
       const emiTotal = roundMoney(row.emi_amount)
-      // 2) Interest income Out on customer ledger (2 days before due).
-      // Principal was already Out at disbursement — only interest increases due here.
+      // Interest income as Sales (sale was booked at create; only interest adds here).
       if (interest > 0) {
         postedTx = pushTx(state, {
           type: 'payment',
           category: 'sales',
           amount: interest,
-          remarks: `${label} · Interest income · EMI #${row.installment_no} · Due ${dueDate} · EMI ${emiTotal} (P ${principalPart} + I ${interest})`,
+          remarks: `${label} · EMI interest · EMI #${row.installment_no} · Period end ${dueDate} · EMI ${emiTotal} (P ${principalPart} + I ${interest})`,
           userId: state.activeUserId || state.users.find((u) => u.role === 'shopkeeper')?.id,
           userName:
             state.users.find((u) => u.id === state.activeUserId)?.name ||
@@ -372,7 +442,10 @@ export async function payLoanEmi(
 
   // Ensure EMI is on the ledger first (allows early pay before the auto post day)
   if (inst.status === 'pending') {
-    await materializeLoanEmis(state, emiLedgerDate(inst.dueDate))
+    await materializeLoanEmis(
+      state,
+      emiLedgerDate(inst.dueDate, detail.loan.emiFrequency),
+    )
   }
 
   const cash = (state.cashAccounts ?? []).find((a) => a.id === cashAccountId)
@@ -554,7 +627,7 @@ export async function updateCustomerLoan(state, loanId, input) {
   const remarks =
     input.remarks === undefined
       ? loan.remarks
-      : String(input.remarks ?? '').trim() || 'Customer loan'
+      : String(input.remarks ?? '').trim() || 'Sale on EMI'
 
   if (!canEditTerms) {
     await getPool().query(
@@ -571,6 +644,12 @@ export async function updateCustomerLoan(state, loanId, input) {
   const interestRate = Number(
     input.interestRate === undefined ? loan.interestRate : input.interestRate,
   )
+  const interestType = normalizeInterestType(
+    input.interestType === undefined ? loan.interestType : input.interestType,
+  )
+  const emiFrequency = normalizeEmiFrequency(
+    input.emiFrequency === undefined ? loan.emiFrequency : input.emiFrequency,
+  )
   const tenureMonths = Math.round(
     Number(input.tenureMonths === undefined ? loan.tenureMonths : input.tenureMonths),
   )
@@ -578,7 +657,9 @@ export async function updateCustomerLoan(state, loanId, input) {
     input.loanDate || input.startDate || loan.loanDate || loan.startDate,
   )
   const emiStartDate = String(
-    input.emiStartDate || loan.emiStartDate || loanDate,
+    input.emiStartDate ||
+      loan.emiStartDate ||
+      defaultEmiStartDate(loanDate, emiFrequency),
   )
   if (!/^\d{4}-\d{2}-\d{2}$/.test(loanDate)) {
     throw new Error('Enter a valid loan date')
@@ -589,43 +670,62 @@ export async function updateCustomerLoan(state, loanId, input) {
   if (emiStartDate < loanDate) {
     throw new Error('EMI start date cannot be before loan date')
   }
-  if (!(principal > 0)) throw new Error('Principal must be greater than 0')
+  if (!(principal > 0)) throw new Error('Sale amount must be greater than 0')
   if (!(tenureMonths > 0)) throw new Error('Tenure must be greater than 0')
   if (!(interestRate >= 0)) throw new Error('Interest rate cannot be negative')
 
-  const emiAmount = calculateEmi(principal, interestRate, tenureMonths)
+  const emiAmount = calculateEmi(
+    principal,
+    interestRate,
+    tenureMonths,
+    interestType,
+    emiFrequency,
+  )
   const schedule = buildAmortizationSchedule(
     principal,
     interestRate,
     tenureMonths,
     emiStartDate,
+    interestType,
+    emiFrequency,
   )
   const nextDueDate = schedule[0]?.dueDate ?? null
+  const rateLabel = interestType === 'flat' ? 'flat' : 'reducing'
+  const freqLabel = emiFrequency === 'weekly' ? 'weekly' : 'monthly'
 
-  // Update disbursement ledger amount / date if principal or loan date changed
+  // Update sale ledger amount / date if principal or loan date changed
   if (loan.disbursementTxId) {
     const tx = state.transactions.find((t) => t.id === loan.disbursementTxId)
     if (tx) {
-      tx.amount = principal
+      const saleAmt = roundMoney(
+        Number(loan.saleAmount ?? principal + (loan.downPayment || 0)),
+      )
+      tx.amount = saleAmt
+      tx.category = 'sales'
+      tx.type = 'payment'
       tx.createdAt = uniqueTxCreatedAt(
         state.transactions.filter((t) => t.id !== tx.id),
         new Date(`${loanDate}T12:00:00`),
       )
       const label = loanLabel(loan.loanNo, remarks)
-      tx.remarks = `${label} · Principal Out`
+      tx.remarks = `${label} · Sale on EMI · ${freqLabel} · ${rateLabel} ${interestRate}% · ${tenureMonths} ${
+        emiFrequency === 'weekly' ? 'wk' : 'mo'
+      } · EMI ${emiAmount}`
     }
   }
 
   await getPool().query(
     `UPDATE customer_loans
-     SET principal = ?, outstanding_principal = ?, interest_rate = ?, tenure_months = ?,
-         emi_amount = ?, start_date = ?, emi_start_date = ?, next_due_date = ?,
-         remarks = ?, updated_at = ?
+     SET principal = ?, outstanding_principal = ?, interest_rate = ?, interest_type = ?,
+         emi_frequency = ?, tenure_months = ?, emi_amount = ?, start_date = ?, emi_start_date = ?,
+         next_due_date = ?, remarks = ?, updated_at = ?
      WHERE id = ? AND shop_app_id = ?`,
     [
       principal,
       principal,
       interestRate,
+      interestType,
+      emiFrequency,
       tenureMonths,
       emiAmount,
       loanDate,

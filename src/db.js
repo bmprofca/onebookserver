@@ -577,7 +577,11 @@ async function ensureSchema() {
       customer_phone VARCHAR(15) NOT NULL DEFAULT '',
       principal DECIMAL(14,2) NOT NULL,
       outstanding_principal DECIMAL(14,2) NOT NULL,
+      down_payment DECIMAL(14,2) NOT NULL DEFAULT 0,
+      sale_amount DECIMAL(14,2) NULL,
       interest_rate DECIMAL(8,4) NOT NULL,
+      interest_type VARCHAR(20) NOT NULL DEFAULT 'reducing',
+      emi_frequency VARCHAR(20) NOT NULL DEFAULT 'monthly',
       tenure_months INT NOT NULL,
       emi_amount DECIMAL(14,2) NOT NULL,
       start_date DATE NOT NULL,
@@ -586,6 +590,7 @@ async function ensureSchema() {
       status VARCHAR(20) NOT NULL DEFAULT 'active',
       remarks VARCHAR(500) NOT NULL DEFAULT '',
       disbursement_tx_id CHAR(36) NULL,
+      down_payment_tx_id CHAR(36) NULL,
       closed_at DATETIME(3) NULL,
       preclosure_charge DECIMAL(14,2) NOT NULL DEFAULT 0,
       created_by_user_id CHAR(36) NOT NULL,
@@ -652,6 +657,76 @@ async function ensureSchema() {
         if (!/Duplicate|exists/i.test(msg)) {
             console.warn('[MySQL] loan_no unique migrate skipped:', msg);
         }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN interest_type VARCHAR(20) NOT NULL DEFAULT 'reducing' AFTER interest_rate
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] interest_type migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN emi_frequency VARCHAR(20) NOT NULL DEFAULT 'monthly' AFTER interest_type
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] emi_frequency migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN down_payment DECIMAL(14,2) NOT NULL DEFAULT 0 AFTER outstanding_principal
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] down_payment migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN sale_amount DECIMAL(14,2) NULL AFTER down_payment
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] sale_amount migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      ALTER TABLE customer_loans
+        ADD COLUMN down_payment_tx_id CHAR(36) NULL AFTER disbursement_tx_id
+    `);
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!/Duplicate column/i.test(msg)) {
+            console.warn('[MySQL] down_payment_tx_id migrate skipped:', msg);
+        }
+    }
+    try {
+        await p.query(`
+      UPDATE customer_loans
+      SET sale_amount = principal + COALESCE(down_payment, 0)
+      WHERE sale_amount IS NULL
+    `);
+    }
+    catch (err) {
+        console.warn('[MySQL] sale_amount backfill skipped:', err instanceof Error ? err.message : err);
     }
     await p.query(`
     CREATE TABLE IF NOT EXISTS loan_installments (
