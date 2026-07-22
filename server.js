@@ -1049,12 +1049,9 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
             });
             saveAuth(auth);
         }
+        // Durable opening write only — do not await full shop flush (too slow on Hostinger).
         if (role === 'customer') {
-            await flushStore();
             await writeCustomerOpeningBalance(userId, openingBalance);
-        }
-        else {
-            await flushStore();
         }
     }
     catch (err) {
@@ -1204,7 +1201,7 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
             });
             saveAuth(auth);
         }
-        await flushStore();
+        // Fast durable write — respond without waiting for full shop rewrite.
         await writeCustomerOpeningBalance(id, openingBalance);
     }
     catch (err) {
