@@ -265,7 +265,7 @@ function normalizeState(raw) {
         phone: u.phone ?? '',
         email: u.email ?? null,
         role: u.role ?? 'shopkeeper',
-        openingBalance: Number(u.openingBalance) || 0,
+        openingBalance: toOpeningBalance(u.openingBalance),
     }));
     raw.transactions = (raw.transactions ?? []).map((tx) => ({
         ...tx,
@@ -369,7 +369,16 @@ function enqueuePersist(task) {
         .then(task)
         .catch((err) => {
         console.error('[MySQL] persist failed:', err instanceof Error ? err.message : err);
+        // Keep the chain alive so later saves still run.
     });
+}
+
+/** Coerce opening balance to a finite number (supports payable negatives). */
+export function toOpeningBalance(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n))
+        return 0;
+    return Math.round(n * 100) / 100;
 }
 function toMysqlDate(iso) {
     const d = new Date(iso);
@@ -409,35 +418,62 @@ async function persistAuth(auth) {
         await conn.query('DELETE FROM sessions');
         await conn.query('DELETE FROM otps');
         await conn.query('DELETE FROM pending_registrations');
-        // Upsert users (do not wipe opening_balance — that lives on shop member rows).
-        const [balRows] = await conn.query('SELECT id, opening_balance FROM users');
+
+        // Resolve latest opening balances before any rewrite.
         const openingById = new Map();
+        const [balRows] = await conn.query('SELECT id, opening_balance FROM users');
         for (const r of balRows) {
-            openingById.set(String(r.id), Number(r.opening_balance) || 0);
+            openingById.set(String(r.id), toOpeningBalance(r.opening_balance));
         }
-        // Prefer in-memory shop state (latest edits) over DB snapshot.
         for (const shop of shopCaches.values()) {
             for (const u of shop.users ?? []) {
-                if (typeof u.openingBalance === 'number' && Number.isFinite(u.openingBalance)) {
-                    openingById.set(String(u.id), Number(u.openingBalance) || 0);
-                }
+                openingById.set(String(u.id), toOpeningBalance(u.openingBalance));
             }
         }
-        await conn.query('DELETE FROM users');
+
+        // Upsert first (keeps opening_balance), then delete orphans — never blank-wipe.
+        // Keep auth login accounts AND any shop member rows (customers may not all be in auth).
+        const keepIdSet = new Set();
         for (const a of auth.accounts) {
+            keepIdSet.add(String(a.id));
+        }
+        for (const shop of shopCaches.values()) {
+            for (const u of shop.users ?? []) {
+                keepIdSet.add(String(u.id));
+            }
+        }
+        const keepIds = [...keepIdSet];
+        for (const a of auth.accounts) {
+            const id = String(a.id);
             await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-                a.id,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           name = VALUES(name),
+           phone = VALUES(phone),
+           email = VALUES(email),
+           role = VALUES(role),
+           phone_verified = VALUES(phone_verified),
+           shop_app_id = VALUES(shop_app_id),
+           opening_balance = VALUES(opening_balance)`, [
+                id,
                 a.name,
                 a.phone,
                 a.email ?? null,
                 a.role,
                 a.phoneVerified ? 1 : 0,
                 a.shopAppId,
-                openingById.get(a.id) ?? 0,
+                openingById.has(id) ? openingById.get(id) : 0,
                 toMysqlDate(a.createdAt),
             ]);
         }
+        if (keepIds.length > 0) {
+            const placeholders = keepIds.map(() => '?').join(',');
+            await conn.query(`DELETE FROM users WHERE id NOT IN (${placeholders})`, keepIds);
+        }
+        else {
+            await conn.query('DELETE FROM users');
+        }
+
         for (const s of auth.sessions) {
             await conn.query(`INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)`, [s.token, s.userId, toMysqlDate(s.createdAt), s.expiresAt]);
         }
@@ -687,7 +723,7 @@ async function persistShop(state, ownerUserId) {
                 u.email ?? null,
                 u.role,
                 appId,
-                Number(u.openingBalance) || 0,
+                toOpeningBalance(u.openingBalance),
                 toMysqlDate(u.createdAt),
             ]);
         }
@@ -801,7 +837,7 @@ async function loadShopFromDb(appId) {
             phone: String(u.phone),
             email: u.email == null ? null : String(u.email),
             role: u.role,
-            openingBalance: Number(u.opening_balance) || 0,
+            openingBalance: toOpeningBalance(u.opening_balance),
             createdAt: fromMysqlDate(u.created_at),
         })),
         cashAccounts,

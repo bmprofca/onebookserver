@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, } from './src/store.js';
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
@@ -1049,6 +1049,7 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
             });
             saveAuth(auth);
         }
+        await flushStore();
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -1197,6 +1198,7 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
             });
             saveAuth(auth);
         }
+        await flushStore();
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
