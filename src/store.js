@@ -1243,31 +1243,27 @@ export function normalizePhone(phone) {
 export function isValidPhone(phone) {
     return /^\d{10}$/.test(normalizePhone(phone));
 }
-/** True if this mobile already exists in the MySQL users table. */
-export async function phoneExistsInDatabase(phone, excludeUserId) {
-    const normalized = normalizePhone(phone);
-    if (!/^\d{10}$/.test(normalized))
-        return false;
-    const [rows] = excludeUserId
-        ? await getPool().query('SELECT id FROM users WHERE phone = ? AND id <> ? LIMIT 1', [normalized, excludeUserId])
-        : await getPool().query('SELECT id FROM users WHERE phone = ? LIMIT 1', [normalized]);
-    return rows.length > 0;
-}
-
-/** True if this mobile is already a member of this shop. */
+/** True if this mobile is already a customer in this shop (last-10 match). */
 export async function phoneExistsInShop(phone, shopAppId, excludeUserId) {
     const normalized = normalizePhone(phone);
     if (!/^\d{10}$/.test(normalized) || !shopAppId)
         return false;
-    const [rows] = excludeUserId
-        ? await getPool().query(
-            'SELECT id FROM users WHERE phone = ? AND shop_app_id = ? AND id <> ? LIMIT 1',
-            [normalized, shopAppId, excludeUserId],
-        )
-        : await getPool().query(
-            'SELECT id FROM users WHERE phone = ? AND shop_app_id = ? LIMIT 1',
-            [normalized, shopAppId],
-        );
+    const sql = excludeUserId
+        ? `SELECT id FROM users
+           WHERE shop_app_id = ?
+             AND role = 'customer'
+             AND RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) = ?
+             AND id <> ?
+           LIMIT 1`
+        : `SELECT id FROM users
+           WHERE shop_app_id = ?
+             AND role = 'customer'
+             AND RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) = ?
+           LIMIT 1`;
+    const params = excludeUserId
+        ? [shopAppId, normalized, excludeUserId]
+        : [shopAppId, normalized];
+    const [rows] = await getPool().query(sql, params);
     return rows.length > 0;
 }
 

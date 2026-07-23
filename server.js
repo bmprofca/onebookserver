@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInDatabase, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, writeCustomerOpeningBalance, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, writeCustomerOpeningBalance, } from './src/store.js';
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
@@ -53,6 +53,10 @@ import {
     getWhatsAppLiveSession,
     getShopWhatsAppChatCredentials,
 } from './src/whatsappManager.js';
+import {
+    getPlatformWhatsAppTokens,
+    savePlatformWhatsAppTokens,
+} from './src/platformWhatsApp.js';
 import {
     buildAmortizationSchedule,
     calculateEmi,
@@ -189,12 +193,18 @@ async function issueOtp(phone, purpose) {
         }
         await Promise.all(jobs);
         const missing = channels.filter((c) => !sent.includes(c));
-        if (sent.length === 0 || (requireBoth && missing.length > 0)) {
+        if (sent.length === 0) {
             return {
                 ok: false,
                 status: 502,
-                error: `Could not send OTP on ${missing.join(' and ') || 'any channel'} (${errors.join('; ') || 'no channel succeeded'})`,
+                error: `Could not send OTP (${errors.join('; ') || 'WhatsApp and SMS both failed'}). Try again in a moment.`,
             };
+        }
+        // Prefer both channels, but do not block login/register if one provider is down.
+        if (requireBoth && missing.length > 0) {
+            console.warn(
+                `[OTP ${purpose}] ${phone} partial delivery — missing ${missing.join(' and ')} (${errors.join('; ') || 'unknown'})`,
+            );
         }
         const channel = toDeliveryChannel(sent);
         console.log(`[OTP ${purpose}] ${phone} → ${channel}`);
@@ -344,12 +354,12 @@ app.post('/api/public/join/:appId', async (req, res) => {
         res.status(400).json({ error: 'Enter a valid 10-digit mobile number' });
         return;
     }
-    if (shop.users.some((u) => normalizePhone(u.phone) === phone)) {
+    if (shop.users.some((u) => u.role === 'customer' && normalizePhone(u.phone) === phone)) {
         res.status(409).json({ error: 'This mobile is already linked to this shop' });
         return;
     }
     const auth = loadAuth();
-    if (auth.accounts.some((a) => normalizePhone(a.phone) === phone && a.shopAppId === shop.appId)) {
+    if (auth.accounts.some((a) => a.role === 'customer' && normalizePhone(a.phone) === phone && a.shopAppId === shop.appId)) {
         res.status(409).json({
             error: 'This mobile is already linked to this shop. Login with OTP instead.',
         });
@@ -394,7 +404,7 @@ app.post('/api/public/join/:appId', async (req, res) => {
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile already exists in the database' });
+            res.status(409).json({ error: 'This mobile is already linked to this shop' });
             return;
         }
         console.error('[join] create failed', err);
@@ -1016,12 +1026,12 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
         res.status(400).json({ error: 'Complete setup first' });
         return;
     }
-    if (phone && state.users.some((u) => normalizePhone(u.phone) === phone)) {
+    if (phone && state.users.some((u) => u.role === 'customer' && normalizePhone(u.phone) === phone)) {
         res.status(409).json({ error: 'This mobile number is already added in this shop' });
         return;
     }
     const auth = loadAuth();
-    if (phone && auth.accounts.some((a) => normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
+    if (phone && auth.accounts.some((a) => a.role === 'customer' && normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
         res.status(409).json({
             error: 'This mobile number is already linked to this shop. Ask them to login with OTP.',
         });
@@ -1147,26 +1157,30 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
         res.status(400).json({ error: 'Edit shopkeeper details from Profile' });
         return;
     }
-    if (state.users.some((u) => u.id !== id && normalizePhone(u.phone) === phone)) {
-        res.status(409).json({ error: 'This mobile number is already used by another customer' });
-        return;
-    }
-    const auth = loadAuth();
-    if (auth.accounts.some((a) => a.id !== id && normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
-        res.status(409).json({ error: 'This mobile number is already used in this shop' });
-        return;
-    }
-    try {
-        if (await phoneExistsInShop(phone, state.appId, id)) {
+    const phoneUnchanged = normalizePhone(target.phone) === phone;
+    if (!phoneUnchanged) {
+        if (state.users.some((u) => u.id !== id && u.role === 'customer' && normalizePhone(u.phone) === phone)) {
+            res.status(409).json({ error: 'This mobile number is already used by another customer in this shop' });
+            return;
+        }
+        const auth = loadAuth();
+        if (auth.accounts.some((a) => a.id !== id && a.role === 'customer' && normalizePhone(a.phone) === phone && a.shopAppId === state.appId)) {
             res.status(409).json({ error: 'This mobile number is already used in this shop' });
             return;
         }
+        try {
+            if (await phoneExistsInShop(phone, state.appId, id)) {
+                res.status(409).json({ error: 'This mobile number is already used in this shop' });
+                return;
+            }
+        }
+        catch (err) {
+            console.error('[users] phone lookup failed', err);
+            res.status(500).json({ error: 'Could not validate mobile number' });
+            return;
+        }
     }
-    catch (err) {
-        console.error('[users] phone lookup failed', err);
-        res.status(500).json({ error: 'Could not validate mobile number' });
-        return;
-    }
+    const auth = loadAuth();
     const prevPhone = target.phone;
     const updated = {
         ...target,
@@ -1227,7 +1241,7 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile number already exists in the database' });
+            res.status(409).json({ error: 'This mobile number is already used in this shop' });
             return;
         }
         console.error('[users] update failed', err);
@@ -2115,6 +2129,65 @@ app.post('/api/whatsapp/config/disconnect', requireShopkeeper, async (req, res) 
         res.status(400).json({ error: err instanceof Error ? err.message : 'Could not disconnect OneChatting' });
     }
 });
+
+function requirePlatformAdmin(req, res) {
+    const expected = String(process.env.PLATFORM_ADMIN_API_KEY || '').trim();
+    if (!expected) {
+        res.status(503).json({ error: 'PLATFORM_ADMIN_API_KEY is not configured' });
+        return false;
+    }
+    const provided = String(req.get('x-platform-admin-key') || req.body?.adminKey || '').trim();
+    if (!provided || provided !== expected) {
+        res.status(401).json({ error: 'Unauthorized' });
+        return false;
+    }
+    return true;
+}
+
+/** OneSAAS-CRM platform tokens for admin portal (masked; never returns raw secrets). */
+app.get('/api/admin/platform-whatsapp', async (req, res) => {
+    if (!requirePlatformAdmin(req, res))
+        return;
+    try {
+        const tokens = await getPlatformWhatsAppTokens({ force: true });
+        res.json({
+            ready: tokens.ready,
+            developerTokenSet: tokens.developerTokenSet,
+            userTokenSet: tokens.userTokenSet,
+            developerTokenMasked: tokens.developerTokenMasked,
+            userTokenMasked: tokens.userTokenMasked,
+            updatedAt: tokens.updatedAt,
+        });
+    }
+    catch (err) {
+        res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load platform tokens' });
+    }
+});
+
+app.put('/api/admin/platform-whatsapp', async (req, res) => {
+    if (!requirePlatformAdmin(req, res))
+        return;
+    try {
+        const body = req.body || {};
+        const tokens = await savePlatformWhatsAppTokens({
+            developerToken: body.developerToken,
+            userToken: body.userToken,
+            note: body.note,
+        });
+        res.json({
+            ready: tokens.ready,
+            developerTokenSet: tokens.developerTokenSet,
+            userTokenSet: tokens.userTokenSet,
+            developerTokenMasked: tokens.developerTokenMasked,
+            userTokenMasked: tokens.userTokenMasked,
+            updatedAt: tokens.updatedAt,
+        });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save platform tokens' });
+    }
+});
+
 app.get('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
     const state = loadState(req.account);
     try {
@@ -2201,10 +2274,16 @@ app.post('/api/whatsapp/broadcast', requireShopkeeper, async (req, res) => {
             activity: req.body?.activity,
             recipients: req.body?.recipients,
             shopName: req.body?.shopName || state.shopName,
+            shopAddress: req.body?.shopAddress || state.shopAddress,
             teamName: req.body?.teamName,
             paramMode: req.body?.paramMode,
             templateParams: req.body?.templateParams,
             note: req.body?.note,
+            variables: req.body?.variables,
+            headerMediaUrl: req.body?.headerMediaUrl || req.body?.attachmentUrl,
+            headerMediaName: req.body?.headerMediaName || req.body?.attachmentName,
+            attachmentUrl: req.body?.attachmentUrl,
+            attachmentName: req.body?.attachmentName,
         });
         res.json(result);
     }
@@ -2306,8 +2385,9 @@ app.get('/api/whatsapp/chats', requireShopkeeper, async (req, res) => {
             // Light refresh only — full sync is via POST /chats/sync
             sync = await syncWhatsAppInbox(state.appId, {
                 search: req.query.q ? String(req.query.q) : undefined,
-                maxPages: 1,
-                limit: 50,
+                maxPages: 10,
+                limit: 100,
+                pruneUnseen: false,
             });
         }
         const result = await listWhatsAppChats(state.appId, {
@@ -2326,8 +2406,9 @@ app.post('/api/whatsapp/chats/sync', requireShopkeeper, async (req, res) => {
     try {
         const sync = await syncWhatsAppInbox(state.appId, {
             search: req.body?.search ? String(req.body.search) : undefined,
-            maxPages: Number(req.body?.maxPages) || 3,
-            limit: Number(req.body?.limit) || 50,
+            maxPages: Number(req.body?.maxPages) || 20,
+            limit: Number(req.body?.limit) || 100,
+            pruneUnseen: !req.body?.search,
         });
         const result = await listWhatsAppChats(state.appId, {
             filter: String(req.body?.filter || req.query.filter || 'all'),
@@ -2431,7 +2512,14 @@ app.post('/api/whatsapp/chats/:phone/send', requireShopkeeper, async (req, res) 
             note: req.body?.note,
             attachmentUrl: req.body?.attachmentUrl,
             attachmentName: req.body?.attachmentName,
+            documentName: req.body?.documentName || req.body?.attachmentName,
+            documentLink: req.body?.documentLink || req.body?.attachmentUrl,
             balance: req.body?.balance,
+            invoiceNumber: req.body?.invoiceNumber,
+            invoiceAmount: req.body?.invoiceAmount,
+            invoiceDate: req.body?.invoiceDate,
+            amount: req.body?.amount ?? req.body?.invoiceAmount,
+            date: req.body?.date || req.body?.invoiceDate,
             shopName: state.shopName || req.body?.shopName,
             shopAddress: state.shopAddress || req.body?.shopAddress,
             teamName: req.account?.name || state.shopName,

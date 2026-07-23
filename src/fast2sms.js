@@ -14,6 +14,26 @@ function apiKey() {
 function baseUrl() {
     return (process.env.FAST2SMS_BASE_URL || DEFAULT_BASE_URL).replace(/\/$/, '');
 }
+function fetchTimeoutMs() {
+    return Math.max(5000, Math.min(30000, Number(process.env.FAST2SMS_TIMEOUT_MS || 12000)));
+}
+async function fetchFast2Sms(url, init = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), fetchTimeoutMs());
+    try {
+        return await fetch(url, { ...init, signal: controller.signal });
+    }
+    catch (err) {
+        const code = err?.cause?.code || err?.name || '';
+        if (code === 'AbortError' || /aborted|timeout/i.test(String(err?.message || ''))) {
+            throw new Error('Fast2SMS timed out. Please try again.');
+        }
+        throw err;
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
 function defaultSenderId() {
     return (process.env.FAST2SMS_SENDER_ID?.trim() ||
         process.env.FAST2SMS_DEFAULT_SENDER_ID?.trim());
@@ -119,7 +139,7 @@ export async function sendDltTemplateSms(input) {
     if (input.udf3)
         body.udf3 = input.udf3;
     try {
-        const res = await fetch(`${baseUrl()}/dev/bulkV2`, {
+        const res = await fetchFast2Sms(`${baseUrl()}/dev/bulkV2`, {
             method: 'POST',
             headers: {
                 Authorization: key,
@@ -175,7 +195,7 @@ export async function sendSmsOtp(phone10, otpCode, options) {
                 body.variables_values = variables;
             if (options?.purpose)
                 body.udf1 = options.purpose;
-            const res = await fetch(`${baseUrl()}/dev/otp/send`, {
+            const res = await fetchFast2Sms(`${baseUrl()}/dev/otp/send`, {
                 method: 'POST',
                 headers: {
                     Authorization: key,

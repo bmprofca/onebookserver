@@ -9,7 +9,17 @@ import {
   toWhatsAppNumber,
 } from './onechatting.js'
 import { insertWhatsAppMessageLog } from './whatsappLogs.js'
-import { syncWhatsAppChatsFromProvider } from './whatsappChats.js'
+import {
+  syncWhatsAppChatsFromProvider,
+  chatTokenFingerprintFromConfig,
+  listWhatsAppChats as listWhatsAppChatsRaw,
+  clearWhatsAppChatThreadsForShop,
+  listWhatsAppChatMessages,
+  getWhatsAppChatThread,
+  markWhatsAppChatRead,
+  markWhatsAppChatUnread,
+  assignWhatsAppChat,
+} from './whatsappChats.js'
 import {
   buildBodyTextsFromVariableMap,
   buildWhatsAppVariableContext,
@@ -18,6 +28,11 @@ import {
   listWhatsAppTemplateVariables,
   normalizeVariableMap,
 } from './whatsappVariables.js'
+import {
+  ensurePlatformWhatsAppSchema,
+  getPlatformWhatsAppTokens,
+  peekPlatformWhatsAppTokens,
+} from './platformWhatsApp.js'
 
 const DEFAULT_PROVIDER = 'onechatting'
 
@@ -55,6 +70,27 @@ const EMPTY_ACTIVITY_MAP = Object.fromEntries(
 
 let schemaReady = false
 
+const TOKEN_SOURCE_ONESAAS = 'onesaas'
+const TOKEN_SOURCE_CUSTOMER = 'customer'
+
+function normalizeTokenSource(value) {
+  const raw = String(value || '').trim().toLowerCase()
+  return raw === TOKEN_SOURCE_ONESAAS ? TOKEN_SOURCE_ONESAAS : TOKEN_SOURCE_CUSTOMER
+}
+
+async function resolvePlatformTokens() {
+  return getPlatformWhatsAppTokens()
+}
+
+function platformTokensReadySync() {
+  const peek = peekPlatformWhatsAppTokens()
+  if (peek.loaded) return peek.ready
+  return Boolean(
+    (process.env.ONEBOOK_PLATFORM_DEVELOPER_TOKEN || process.env.ONECHATTING_TOKEN) &&
+      process.env.ONEBOOK_PLATFORM_USER_TOKEN,
+  )
+}
+
 async function ensureWhatsAppSchema() {
   if (schemaReady) return
   const p = getPool()
@@ -63,6 +99,7 @@ async function ensureWhatsAppSchema() {
     `ALTER TABLE shop_whatsapp_config ADD COLUMN connection_status TEXT NULL`,
     `ALTER TABLE shop_whatsapp_config ADD COLUMN user_api_key VARCHAR(500) NULL`,
     `ALTER TABLE shop_whatsapp_config ADD COLUMN user_connection_status TEXT NULL`,
+    `ALTER TABLE shop_whatsapp_config ADD COLUMN token_source VARCHAR(20) NOT NULL DEFAULT 'customer'`,
     `ALTER TABLE shop_whatsapp_templates ADD COLUMN external_id VARCHAR(120) NULL AFTER campaign_name`,
     `ALTER TABLE shop_whatsapp_templates ADD COLUMN activity VARCHAR(40) NOT NULL DEFAULT 'custom' AFTER external_id`,
     `ALTER TABLE shop_whatsapp_templates ADD COLUMN header_format VARCHAR(20) NULL AFTER activity`,
@@ -79,6 +116,8 @@ async function ensureWhatsAppSchema() {
       }
     }
   }
+  await ensurePlatformWhatsAppSchema()
+  await getPlatformWhatsAppTokens({ force: true }).catch(() => {})
   schemaReady = true
 }
 
@@ -138,14 +177,25 @@ function parseConnectionStatus(raw) {
   }
 }
 
-function mapConfig(row) {
+function mapConfig(row, platform = null) {
+  const onesaasReady = Boolean(
+    platform?.ready ?? platformTokensReadySync(),
+  )
+  const onesaasDeveloperMasked = platform?.developerTokenMasked || ''
+  const onesaasUserMasked = platform?.userTokenMasked || ''
   if (!row) {
     return {
       provider: DEFAULT_PROVIDER,
+      tokenSource: TOKEN_SOURCE_CUSTOMER,
+      onesaasReady,
+      onesaasDeveloperMasked,
+      onesaasUserMasked,
       apiKey: '',
       apiKeySet: false,
       userApiKey: '',
       userApiKeySet: false,
+      templatesReady: false,
+      chatsReady: false,
       userChatReady: false,
       projectName: '',
       projectId: '',
@@ -161,16 +211,26 @@ function mapConfig(row) {
   }
   const connectionStatus = parseConnectionStatus(row.connection_status)
   const userConnectionStatus = parseConnectionStatus(row.user_connection_status)
-  const userChatReady = Boolean(
-    row.user_api_key && (userConnectionStatus?.chatApiOk || userConnectionStatus?.tokenKind === 'user'),
-  ) || Boolean(!row.user_api_key && connectionStatus?.chatApiOk)
+  const tokenSource = normalizeTokenSource(row.token_source)
+  const apiKeySet = Boolean(row.api_key)
+  const userApiKeySet = Boolean(row.user_api_key)
+  const templatesReady = Boolean(apiKeySet && row.connected && connectionStatus)
+  const chatsReady =
+    Boolean(userApiKeySet && (userConnectionStatus?.chatApiOk || userConnectionStatus?.tokenKind === 'user')) ||
+    Boolean(!userApiKeySet && connectionStatus?.chatApiOk)
   return {
     provider: row.provider || DEFAULT_PROVIDER,
+    tokenSource,
+    onesaasReady,
+    onesaasDeveloperMasked,
+    onesaasUserMasked,
     apiKey: row.api_key ? '••••' + String(row.api_key).slice(-4) : '',
-    apiKeySet: Boolean(row.api_key),
+    apiKeySet,
     userApiKey: row.user_api_key ? '••••' + String(row.user_api_key).slice(-4) : '',
-    userApiKeySet: Boolean(row.user_api_key),
-    userChatReady,
+    userApiKeySet,
+    templatesReady,
+    chatsReady,
+    userChatReady: chatsReady,
     projectName: row.project_name || '',
     projectId: row.project_id || '',
     wabaId: row.waba_id || '',
@@ -195,7 +255,8 @@ export function resolveChatApiKey(rawConfig) {
 
 export async function getShopWhatsAppChatCredentials(shopAppId) {
   const config = await getRawConfig(shopAppId)
-  const mapped = mapConfig(config)
+  const platform = await getPlatformWhatsAppTokens()
+  const mapped = mapConfig(config, platform)
   return {
     apiKey: resolveChatApiKey(config),
     countryCode: config?.country_code || '91',
@@ -249,7 +310,8 @@ async function getRawConfig(shopAppId) {
 }
 
 export async function getWhatsAppConfig(shopAppId) {
-  return mapConfig(await getRawConfig(shopAppId))
+  const [row, platform] = await Promise.all([getRawConfig(shopAppId), getPlatformWhatsAppTokens()])
+  return mapConfig(row, platform)
 }
 
 export function listWhatsAppActivities() {
@@ -282,7 +344,7 @@ export async function saveWhatsAppActivityMap(shopAppId, inputMap) {
       [activity, templateId, shopAppId],
     )
   }
-  return mapConfig(await getRawConfig(shopAppId))
+  return getWhatsAppConfig(shopAppId)
 }
 
 export async function fetchRemoteWhatsAppTemplates(shopAppId) {
@@ -298,8 +360,11 @@ export async function syncRemoteWhatsAppTemplates(shopAppId) {
     existing.filter((t) => t.externalId).map((t) => [t.externalId, t]),
   )
   const byCampaign = new Map(existing.map((t) => [t.campaignName, t]))
+  const remoteIds = new Set(remote.map((row) => row.templateId).filter(Boolean))
+  const remoteNames = new Set(remote.map((row) => row.templateName).filter(Boolean))
   let created = 0
   let updated = 0
+  let removed = 0
   for (const row of remote) {
     const payload = {
       name: row.templateName,
@@ -328,10 +393,22 @@ export async function syncRemoteWhatsAppTemplates(shopAppId) {
       created += 1
     }
   }
+  // Drop templates that are not on the currently connected developer token account.
+  for (const local of existing) {
+    const keep =
+      (local.externalId && remoteIds.has(local.externalId)) ||
+      remoteNames.has(local.campaignName) ||
+      remoteNames.has(local.name)
+    if (!keep) {
+      await deleteWhatsAppTemplate(shopAppId, local.id)
+      removed += 1
+    }
+  }
   return {
     remoteCount: remote.length,
     created,
     updated,
+    removed,
     templates: await listWhatsAppTemplates(shopAppId),
   }
 }
@@ -368,18 +445,41 @@ export async function refreshWhatsAppTemplate(shopAppId, templateId) {
 export async function saveWhatsAppConfig(shopAppId, input) {
   const existing = await getRawConfig(shopAppId)
   const now = nowIso()
-  const apiKeyIncoming = input.apiKey === undefined ? undefined : String(input.apiKey ?? '').trim()
-  const keepKey = apiKeyIncoming === undefined || apiKeyIncoming === '' || apiKeyIncoming.startsWith('••••')
-  const apiKey = keepKey ? existing?.api_key || '' : apiKeyIncoming
+  const tokenSource = normalizeTokenSource(
+    input.tokenSource ?? existing?.token_source ?? TOKEN_SOURCE_CUSTOMER,
+  )
 
-  const userKeyIncoming =
+  let apiKeyIncoming = input.apiKey === undefined ? undefined : String(input.apiKey ?? '').trim()
+  let userKeyIncoming =
     input.userApiKey === undefined ? undefined : String(input.userApiKey ?? '').trim()
+
+  if (tokenSource === TOKEN_SOURCE_ONESAAS) {
+    const platform = await resolvePlatformTokens()
+    if (!platform.ready) {
+      throw new Error(
+        'OneSAAS-CRM tokens are not ready yet. They will be managed from the OneBook admin portal. Use “My OneChatting tokens” for now.',
+      )
+    }
+    apiKeyIncoming = platform.developerToken
+    userKeyIncoming = platform.userToken
+  }
+
+  const keepKey =
+    tokenSource !== TOKEN_SOURCE_ONESAAS &&
+    (apiKeyIncoming === undefined || apiKeyIncoming === '' || apiKeyIncoming.startsWith('••••'))
+  const apiKey = keepKey ? existing?.api_key || '' : apiKeyIncoming || ''
+
   const clearUserKey = input.clearUserApiKey === true
   const keepUserKey =
+    tokenSource !== TOKEN_SOURCE_ONESAAS &&
     !clearUserKey &&
     (userKeyIncoming === undefined || userKeyIncoming === '' || userKeyIncoming.startsWith('••••'))
   let userApiKey = keepUserKey ? existing?.user_api_key || null : userKeyIncoming || null
   if (clearUserKey) userApiKey = null
+
+  if (tokenSource === TOKEN_SOURCE_CUSTOMER && !apiKey) {
+    throw new Error('Paste your OneChatting developer token')
+  }
 
   const provider = 'onechatting'
   const projectName = String(input.projectName ?? existing?.project_name ?? '').trim().slice(0, 160)
@@ -394,13 +494,13 @@ export async function saveWhatsAppConfig(shopAppId, input) {
   if (!apiKey) {
     probe = { ok: false, error: 'Paste your OneChatting developer token' }
     connectionStatus = null
-  } else if (!keepKey || !connectionStatus) {
+  } else if (!keepKey || !connectionStatus || tokenSource === TOKEN_SOURCE_ONESAAS) {
     probe = await probeOneChattingToken(apiKey)
     if (probe.ok && probe.status) {
       connectionStatus = probe.status
       if (probe.status.projectId) projectId = String(probe.status.projectId).slice(0, 120)
       if (probe.status.wabaId) wabaId = String(probe.status.wabaId).slice(0, 120)
-    } else if (!keepKey) {
+    } else if (!keepKey || tokenSource === TOKEN_SOURCE_ONESAAS) {
       connectionStatus = null
     }
   } else {
@@ -411,11 +511,11 @@ export async function saveWhatsAppConfig(shopAppId, input) {
   let userConnectionStatus = parseConnectionStatus(existing?.user_connection_status)
   if (clearUserKey) {
     userConnectionStatus = null
-  } else if (userApiKey && (!keepUserKey || !userConnectionStatus)) {
+  } else if (userApiKey && (!keepUserKey || !userConnectionStatus || tokenSource === TOKEN_SOURCE_ONESAAS)) {
     userProbe = await probeOneChattingUserToken(userApiKey)
     if (userProbe.ok && userProbe.status) {
       userConnectionStatus = userProbe.status
-    } else if (!keepUserKey) {
+    } else if (!keepUserKey || tokenSource === TOKEN_SOURCE_ONESAAS) {
       throw new Error(userProbe?.error || 'Could not verify User Token')
     }
   }
@@ -433,7 +533,7 @@ export async function saveWhatsAppConfig(shopAppId, input) {
       `UPDATE shop_whatsapp_config
        SET provider = ?, api_key = ?, user_api_key = ?, project_name = ?, project_id = ?, waba_id = ?,
            phone_number_id = ?, country_code = ?, connected = ?, connection_status = ?,
-           user_connection_status = ?, updated_at = ?
+           user_connection_status = ?, token_source = ?, updated_at = ?
        WHERE shop_app_id = ?`,
       [
         provider,
@@ -447,6 +547,7 @@ export async function saveWhatsAppConfig(shopAppId, input) {
         connected ? 1 : 0,
         connectionStatus ? JSON.stringify(connectionStatus) : null,
         userConnectionStatus ? JSON.stringify(userConnectionStatus) : null,
+        tokenSource,
         toMysqlDate(now),
         shopAppId,
       ],
@@ -455,8 +556,8 @@ export async function saveWhatsAppConfig(shopAppId, input) {
     await getPool().query(
       `INSERT INTO shop_whatsapp_config
         (shop_app_id, provider, api_key, user_api_key, project_name, project_id, waba_id, phone_number_id,
-         country_code, connected, connection_status, user_connection_status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         country_code, connected, connection_status, user_connection_status, token_source, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         shopAppId,
         provider,
@@ -470,11 +571,23 @@ export async function saveWhatsAppConfig(shopAppId, input) {
         connected ? 1 : 0,
         connectionStatus ? JSON.stringify(connectionStatus) : null,
         userConnectionStatus ? JSON.stringify(userConnectionStatus) : null,
+        tokenSource,
         toMysqlDate(now),
         toMysqlDate(now),
       ],
     )
   }
+
+  const prevFp = chatTokenFingerprintFromConfig(existing)
+  const nextFp = chatTokenFingerprintFromConfig({
+    token_source: tokenSource,
+    user_api_key: userApiKey,
+    api_key: apiKey,
+  })
+  if (prevFp !== nextFp) {
+    await clearWhatsAppChatThreadsForShop(shopAppId)
+  }
+
   return {
     config: await getWhatsAppConfig(shopAppId),
     probe,
@@ -497,12 +610,20 @@ export async function refreshWhatsAppConnectionStatus(shopAppId) {
   const projectId = status?.projectId || existing.project_id || null
   const wabaId = status?.wabaId || existing.waba_id || null
   const displayPhone = status?.displayPhone || existing.phone_number_id || null
+  let userConnectionStatus = parseConnectionStatus(existing.user_connection_status)
+  let userProbe = null
+  if (existing.user_api_key) {
+    userProbe = await probeOneChattingUserToken(existing.user_api_key)
+    if (userProbe.ok && userProbe.status) userConnectionStatus = userProbe.status
+  }
   await getPool().query(
     `UPDATE shop_whatsapp_config
-     SET connected = 1, connection_status = ?, project_id = ?, waba_id = ?, phone_number_id = ?, updated_at = ?
+     SET connected = 1, connection_status = ?, user_connection_status = ?, project_id = ?, waba_id = ?,
+         phone_number_id = ?, updated_at = ?
      WHERE shop_app_id = ?`,
     [
       status ? JSON.stringify(status) : null,
+      userConnectionStatus ? JSON.stringify(userConnectionStatus) : null,
       projectId,
       wabaId,
       displayPhone,
@@ -510,7 +631,7 @@ export async function refreshWhatsAppConnectionStatus(shopAppId) {
       shopAppId,
     ],
   )
-  return { config: await getWhatsAppConfig(shopAppId), probe }
+  return { config: await getWhatsAppConfig(shopAppId), probe, userProbe }
 }
 
 export async function disconnectWhatsAppConfig(shopAppId) {
@@ -521,10 +642,11 @@ export async function disconnectWhatsAppConfig(shopAppId) {
   }
   await getPool().query(
     `UPDATE shop_whatsapp_config
-     SET api_key = NULL, project_id = NULL, waba_id = NULL, phone_number_id = NULL,
-         connected = 0, connection_status = NULL, updated_at = ?
+     SET api_key = NULL, user_api_key = NULL, project_id = NULL, waba_id = NULL, phone_number_id = NULL,
+         connected = 0, connection_status = NULL, user_connection_status = NULL,
+         token_source = ?, updated_at = ?
      WHERE shop_app_id = ?`,
-    [toMysqlDate(nowIso()), shopAppId],
+    [TOKEN_SOURCE_CUSTOMER, toMysqlDate(nowIso()), shopAppId],
   )
   return { config: await getWhatsAppConfig(shopAppId) }
 }
@@ -921,7 +1043,25 @@ function resolveBodyTextsForSend({
     template.activity === 'sales_invoice' ||
     activity === 'sales_invoice'
   ) {
-    return [customerName, shopName]
+    if (activity === 'sales_invoice' || template.activity === 'sales_invoice') {
+      return [
+        customerName,
+        formatAmountPlain(
+          Number.isFinite(Number(recipient.invoiceAmount))
+            ? Number(recipient.invoiceAmount)
+            : Number.isFinite(balance)
+              ? balance
+              : 0,
+        ),
+        String(recipient.invoiceNumber || '').trim() || 'Invoice',
+        shopName,
+      ]
+    }
+    return [
+      customerName,
+      String(recipient.documentName || 'Document').trim() || 'Document',
+      shopName,
+    ]
   }
   if (template.activity === 'reminder_activity' || activity === 'reminder_activity') {
     return [customerName, String(recipient.note || note || 'Reminder'), shopName]
@@ -968,6 +1108,26 @@ export async function broadcastWhatsAppMessages(shopAppId, account, input) {
     activityAttachmentName = resolved.attachmentName || null
   }
   if (!template) throw new Error('Select a template or activity to broadcast')
+
+  // Client overrides (Broadcast UI template pick + variable map + attachment)
+  if (input.variables && typeof input.variables === 'object') {
+    const next = {}
+    for (const [k, v] of Object.entries(input.variables)) {
+      if (/^\d+$/.test(k) && v) next[k] = String(v)
+    }
+    if (Object.keys(next).length) activityVariables = next
+  }
+  if (input.headerMediaUrl != null && String(input.headerMediaUrl).trim()) {
+    activityAttachmentUrl = String(input.headerMediaUrl).trim()
+  }
+  if (input.headerMediaName != null && String(input.headerMediaName).trim()) {
+    activityAttachmentName = String(input.headerMediaName).trim()
+  } else if (input.attachmentName != null && String(input.attachmentName).trim()) {
+    activityAttachmentName = String(input.attachmentName).trim()
+  }
+  if (input.attachmentUrl != null && String(input.attachmentUrl).trim()) {
+    activityAttachmentUrl = String(input.attachmentUrl).trim()
+  }
 
   const recipients = Array.isArray(input.recipients) ? input.recipients : []
   if (recipients.length === 0) throw new Error('Select at least one customer')
@@ -1095,12 +1255,41 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
     .slice(-10)
   if (phone.length !== 10) throw new Error('Enter a valid 10-digit mobile number')
 
-  const [trows] = await getPool().query(
-    `SELECT * FROM shop_whatsapp_templates WHERE id = ? AND shop_app_id = ?`,
-    [input.templateId, shopAppId],
-  )
-  if (!trows[0]) throw new Error('Template not found')
-  const template = mapTemplate(trows[0])
+  const activity = input.activity ? String(input.activity) : null
+  let template = null
+  let activityVariables = {}
+  let activityAttachmentUrl = null
+  let activityAttachmentName = null
+
+  if (input.templateId) {
+    const [trows] = await getPool().query(
+      `SELECT * FROM shop_whatsapp_templates WHERE id = ? AND shop_app_id = ?`,
+      [input.templateId, shopAppId],
+    )
+    if (!trows[0]) throw new Error('Template not found')
+    template = mapTemplate(trows[0])
+    if (activity) {
+      const binding = await resolveWhatsAppActivityBinding(shopAppId, activity)
+      if (binding?.template?.id === template.id) {
+        activityVariables = binding.variables || {}
+        activityAttachmentUrl = binding.attachmentUrl || null
+        activityAttachmentName = binding.attachmentName || null
+      }
+    }
+  } else if (activity) {
+    const resolved = await resolveWhatsAppActivityBinding(shopAppId, activity)
+    if (!resolved?.template) {
+      throw new Error(
+        `No template mapped for “${activity}”. Open WhatsApp → Mapping and assign a template.`,
+      )
+    }
+    template = resolved.template
+    activityVariables = resolved.variables || {}
+    activityAttachmentUrl = resolved.attachmentUrl || null
+    activityAttachmentName = resolved.attachmentName || null
+  } else {
+    throw new Error('Select a WhatsApp template')
+  }
 
   const customerName =
     String(input.customerName || input.userName || 'Customer').trim() || 'Customer'
@@ -1109,11 +1298,13 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
   const customParams = Array.isArray(input.templateParams)
     ? input.templateParams.map((p) => String(p))
     : []
-  const variables =
-    input.variables && typeof input.variables === 'object' ? input.variables : {}
+  const variables = {
+    ...activityVariables,
+    ...(input.variables && typeof input.variables === 'object' ? input.variables : {}),
+  }
 
   const bodyTexts = resolveBodyTextsForSend({
-    activity: input.activity || template.activity || 'custom',
+    activity: activity || template.activity || 'custom',
     template,
     variables,
     recipient: {
@@ -1122,13 +1313,13 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
       balance: input.balance,
       openingBalance: input.openingBalance,
       note: input.note,
-      documentName: input.documentName,
-      documentLink: input.documentLink,
+      documentName: input.documentName || input.attachmentName || activityAttachmentName,
+      documentLink: input.documentLink || input.attachmentUrl || activityAttachmentUrl,
       invoiceNumber: input.invoiceNumber,
       invoiceAmount: input.invoiceAmount,
       invoiceDate: input.invoiceDate,
-      amount: input.amount,
-      date: input.date,
+      amount: input.amount ?? input.invoiceAmount,
+      date: input.date || input.invoiceDate,
       activityTitle: input.activityTitle,
       dueDate: input.dueDate,
       templateParams: customParams,
@@ -1141,8 +1332,18 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
     note: input.note || '',
   })
 
-  const headerMediaUrl = input.attachmentUrl || template.headerMediaUrl || null
-  const headerMediaType = String(template.headerFormat || '').toUpperCase() || null
+  const headerMediaUrl =
+    input.attachmentUrl || activityAttachmentUrl || template.headerMediaUrl || null
+  const attachmentName =
+    input.attachmentName || activityAttachmentName || input.documentName || null
+  let headerMediaType = String(template.headerFormat || '').toUpperCase() || null
+  if (headerMediaUrl && (!headerMediaType || headerMediaType === 'TEXT')) {
+    const hint = `${attachmentName || ''} ${headerMediaUrl}`
+    headerMediaType = /\.pdf(\?|$)/i.test(hint) ? 'DOCUMENT' : 'IMAGE'
+  }
+  if (headerMediaUrl && /\.pdf(\?|$)/i.test(`${attachmentName || ''} ${headerMediaUrl}`)) {
+    headerMediaType = 'DOCUMENT'
+  }
 
   let result
   try {
@@ -1155,7 +1356,7 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
       countryCode,
       headerMediaUrl,
       headerMediaType,
-      headerMediaName: input.attachmentName || null,
+      headerMediaName: attachmentName || null,
     })
   } catch (err) {
     const error = err instanceof Error ? err.message : 'Send failed'
@@ -1164,7 +1365,7 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
       customerId: input.customerId || null,
       customerName,
       phone,
-      kind: 'chat',
+      kind: activity || template.activity || 'chat',
       templateName: template.name,
       messageBody: bodyTexts.filter(Boolean).join(' · ') || `Template “${template.name}” → ${destination}`,
       ok: false,
@@ -1181,10 +1382,15 @@ export async function sendWhatsAppChatTemplate(shopAppId, account, input) {
     customerId: input.customerId || null,
     customerName,
     phone,
-    kind: 'chat',
+    kind: activity || template.activity || 'template',
     templateName: template.name,
     messageBody:
-      bodyTexts.filter(Boolean).join('\n') || `Template “${template.name}” → ${destination}`,
+      [
+        bodyTexts.filter(Boolean).join('\n') || `Template “${template.name}” → ${destination}`,
+        headerMediaUrl || '',
+      ]
+        .filter(Boolean)
+        .join('\n'),
     ok: true,
     error: null,
     providerMessageId: result.providerMessageId,
@@ -1228,8 +1434,13 @@ export async function syncWhatsAppInbox(shopAppId, options = {}) {
       needsUserToken: true,
     }
   }
-  const sync = await syncWhatsAppChatsFromProvider(shopAppId, token, options)
-  return { ...sync, chatReady }
+  const tokenFingerprint = chatTokenFingerprintFromConfig(config)
+  const sync = await syncWhatsAppChatsFromProvider(shopAppId, token, {
+    ...options,
+    tokenFingerprint,
+    prune: options.prune !== false,
+  })
+  return { ...sync, chatReady, tokenFingerprint }
 }
 
 export async function sendWhatsAppChatTextMessage(shopAppId, account, input) {
@@ -1272,13 +1483,21 @@ export async function getWhatsAppLiveSession(shopAppId) {
   }
 }
 
-// Re-export chat list helpers (implemented in whatsappChats.js)
+// Re-export chat helpers used by server routes
 export {
-  listWhatsAppChats,
   listWhatsAppChatMessages,
   getWhatsAppChatThread,
   markWhatsAppChatRead,
   markWhatsAppChatUnread,
   assignWhatsAppChat,
   syncWhatsAppChatsFromProvider,
-} from './whatsappChats.js'
+  clearWhatsAppChatThreadsForShop,
+  chatTokenFingerprintFromConfig,
+}
+
+/** Inbox list scoped to the currently connected token fingerprint. */
+export async function listWhatsAppChats(shopAppId, opts = {}) {
+  const config = await getRawConfig(shopAppId)
+  const tokenFingerprint = chatTokenFingerprintFromConfig(config)
+  return listWhatsAppChatsRaw(shopAppId, { ...opts, tokenFingerprint })
+}

@@ -746,18 +746,25 @@ async function sendTemplateMessage(phone10, templateRef, bodyTexts, categories, 
       })
     }
 
-    const res = await fetchWithRetry(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        token,
+    const res = await fetchWithRetry(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          token,
+        },
+        body: JSON.stringify({
+          number,
+          template_id: templateId,
+          component,
+        }),
       },
-      body: JSON.stringify({
-        number,
-        template_id: templateId,
-        component,
-      }),
-    })
+      {
+        retries: options.retries ?? 2,
+        timeoutMs: options.timeoutMs ?? 25000,
+      },
+    )
 
     const raw = await res.text()
     let data = {}
@@ -808,7 +815,10 @@ export async function sendWhatsAppOtp(phone10, otpCode) {
   if (!/^\d{4,8}$/.test(otpCode)) {
     return { ok: false, error: 'OTP must be 4–8 digits for WhatsApp AUTHENTICATION templates' }
   }
-  return sendTemplateMessage(phone10, templateRef, [otpCode], ['AUTHENTICATION'])
+  return sendTemplateMessage(phone10, templateRef, [otpCode], ['AUTHENTICATION'], {
+    retries: 1,
+    timeoutMs: 12000,
+  })
 }
 
 /** Amount for "Rs. {{2}}" — Indian grouping, no currency symbol. */
@@ -983,79 +993,211 @@ export async function getOneChattingChatHistory(token, number, options = {}) {
   if (waNumber.length < 10) throw new Error('Invalid WhatsApp number')
 
   const baseUrl = oneChattingBaseUrl()
-  const params = new URLSearchParams({
-    number: waNumber,
-    last_id: String(options.lastId ?? 0),
-    limit: String(Math.min(100, Math.max(1, Number(options.limit) || 100))),
-  })
-
-  const { res, data } = await fetchJson(
-    `${baseUrl}/developer/message/chat-history?${params}`,
-    key,
-  )
-  assertOneChattingOk(
-    res,
-    data,
-    'Could not load chat history. Use a User Token (not Project Token) for live chats.',
-  )
-
-  const rows = Array.isArray(data.data)
-    ? data.data
-    : Array.isArray(data.messages)
-      ? data.messages
-      : Array.isArray(data.chats)
-        ? data.chats
-        : []
+  const pageLimit = Math.min(100, Math.max(1, Number(options.limit) || 100))
+  const maxPages = Math.min(20, Math.max(1, Number(options.maxPages) || 1))
+  let lastId = Number(options.lastId ?? 0) || 0
   const messages = []
-  for (const row of rows) {
+  let assigning = null
+  let lastError = null
+
+  for (let page = 0; page < maxPages; page++) {
+    const params = new URLSearchParams({
+      number: waNumber,
+      last_id: String(lastId),
+      limit: String(pageLimit),
+    })
+
+    const { res, data } = await fetchJson(
+      `${baseUrl}/developer/message/chat-history?${params}`,
+      key,
+    )
     try {
-      const direction = String(row.type || '').toLowerCase() === 'out' ? 'out' : 'in'
-      const messageType = String(row.message_type || 'text').toLowerCase()
-      const body = String(row.message || row.caption || '').trim()
-      const media = extractChatHistoryMedia(row, messageType)
-      messages.push({
-        id: String(row.message_id || row.unique_id || row.id || `${waNumber}-${row.create_date}`),
-        providerId: row.id != null ? Number(row.id) : null,
-        wamid: row.wamid || null,
-        direction,
-        messageType: media.mediaType || messageType,
-        body:
-          body ||
-          (media.mediaType === 'image'
-            ? '[Image]'
-            : media.mediaType === 'video'
-              ? '[Video]'
-              : media.mediaType === 'document'
-                ? '[Document]'
-                : media.mediaType === 'audio'
-                  ? '[Audio]'
-                  : messageType === 'template'
-                    ? '[Template]'
-                    : '[Message]'),
-        status: row.status || 'sent',
-        isTemplate: Boolean(row.is_template) || messageType === 'template',
-        templateName: row.template?.name || row.template_name || null,
-        createdAt: row.create_date || null,
-        sentByName: row.send_by?.name || row.send_by?.username || null,
-        isRead: row.is_read !== false,
-        mediaUrl: media.mediaUrl,
-        mediaName: media.mediaName,
-        mediaMime: media.mediaMime,
-        mediaType: media.mediaType,
-        raw: row,
-      })
+      assertOneChattingOk(
+        res,
+        data,
+        'Could not load chat history. Use a User Token (not Project Token) for live chats.',
+      )
     } catch (err) {
-      console.warn('[OneChatting] skip bad history row', err)
+      lastError = err
+      if (page === 0) throw err
+      break
     }
+
+    if (data.assigning) assigning = data.assigning
+
+    const rows = Array.isArray(data.data)
+      ? data.data
+      : Array.isArray(data.messages)
+        ? data.messages
+        : Array.isArray(data.chats)
+          ? data.chats
+          : []
+
+    if (rows.length === 0) break
+
+    const beforeCount = messages.length
+    for (const row of rows) {
+      try {
+        const direction = String(row.type || '').toLowerCase() === 'out' ? 'out' : 'in'
+        const messageType = String(row.message_type || 'text').toLowerCase()
+        const isTemplate = Boolean(row.is_template) || messageType === 'template'
+        const media = extractChatHistoryMedia(row, messageType)
+        const textParts = extractChatHistoryText(row, { isTemplate, mediaUrl: media.mediaUrl })
+        const body = textParts.body
+        const id = String(
+          row.message_id || row.unique_id || row.id || `${waNumber}-${row.create_date}-${messages.length}`,
+        )
+        if (messages.some((m) => m.id === id)) continue
+        messages.push({
+          id,
+          providerId: row.id != null ? Number(row.id) : null,
+          wamid: row.wamid || null,
+          direction,
+          messageType: media.mediaType || messageType,
+          body:
+            body ||
+            (media.mediaType === 'image'
+              ? '[Image]'
+              : media.mediaType === 'video'
+                ? '[Video]'
+                : media.mediaType === 'document'
+                  ? '[Document]'
+                  : media.mediaType === 'audio'
+                    ? '[Audio]'
+                    : isTemplate
+                      ? '[Template]'
+                      : '[Message]'),
+          headerText: textParts.headerText,
+          footerText: textParts.footerText,
+          status: row.status || 'sent',
+          isTemplate,
+          templateName:
+            row.template?.name ||
+            row.template_name ||
+            row.template?.template_name ||
+            row.campaign_name ||
+            null,
+          createdAt: row.create_date || null,
+          sentByName: row.send_by?.name || row.send_by?.username || null,
+          isRead: row.is_read !== false,
+          mediaUrl: media.mediaUrl,
+          mediaName: media.mediaName,
+          mediaMime: media.mediaMime,
+          mediaType: media.mediaType,
+          raw: row,
+        })
+      } catch (err) {
+        console.warn('[OneChatting] skip bad history row', err)
+      }
+    }
+
+    if (messages.length === beforeCount) break
+
+    const nextLast =
+      data.last_id != null
+        ? Number(data.last_id)
+        : messages.reduce((max, m) => {
+            const n = Number(m.providerId)
+            return Number.isFinite(n) && n > max ? n : max
+          }, lastId)
+    if (!Number.isFinite(nextLast) || nextLast <= lastId) break
+    lastId = nextLast
+    if (rows.length < pageLimit) break
   }
+
+  // OneChatting often returns newest-first; keep chronological for the UI
+  messages.sort((a, b) => {
+    const ta = parseProviderDate(a.createdAt)?.getTime() || 0
+    const tb = parseProviderDate(b.createdAt)?.getTime() || 0
+    return ta - tb
+  })
 
   return {
     number: waNumber,
     messages,
-    count: Number(data.count || messages.length) || messages.length,
-    lastId: data.last_id ?? null,
-    assigning: data.assigning || null,
+    count: messages.length,
+    lastId,
+    assigning,
+    error: lastError ? (lastError instanceof Error ? lastError.message : String(lastError)) : null,
   }
+}
+
+function parseProviderDate(value) {
+  if (!value) return null
+  const raw = String(value).trim()
+  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T')
+  const d = new Date(normalized)
+  if (!Number.isNaN(d.getTime())) return d
+  const d2 = new Date(raw)
+  return Number.isNaN(d2.getTime()) ? null : d2
+}
+
+/** Pull caption / body / template text from a chat-history row. */
+function extractChatHistoryText(row, opts = {}) {
+  const components = extractTemplateComponents(row)
+  let headerText = null
+  let footerText = null
+  let bodyFromComponents = ''
+
+  for (const component of components) {
+    const ctype = String(component?.type || '').toUpperCase()
+    if (ctype === 'HEADER' || ctype === 'header') {
+      if (component?.text) headerText = String(component.text).trim() || headerText
+      const params = Array.isArray(component?.parameters) ? component.parameters : []
+      for (const param of params) {
+        if (param?.text) headerText = String(param.text).trim() || headerText
+      }
+    } else if (ctype === 'BODY' || ctype === 'body') {
+      let text = String(component?.text || component?.body || '').trim()
+      const params = Array.isArray(component?.parameters) ? component.parameters : []
+      if (params.length && text.includes('{{')) {
+        text = text.replace(/\{\{(\d+)\}\}/g, (_, n) => {
+          const idx = Number(n) - 1
+          const p = params[idx]
+          return String(p?.text ?? p?.value ?? p ?? '').trim()
+        })
+      } else if (!text && params.length) {
+        text = params.map((p) => String(p?.text ?? p?.value ?? p ?? '').trim()).filter(Boolean).join('\n')
+      }
+      if (text) bodyFromComponents = text
+    } else if (ctype === 'FOOTER' || ctype === 'footer') {
+      if (component?.text) footerText = String(component.text).trim() || footerText
+    }
+  }
+
+  const captionCandidates = [
+    row.message,
+    row.caption,
+    row.text,
+    row.body,
+    row.body_text,
+    row.media?.caption,
+    row.image?.caption,
+    row.video?.caption,
+    row.document?.caption,
+    row.media_caption,
+    row.message_text,
+    row.content,
+    row.template?.body,
+    row.template_body,
+    bodyFromComponents,
+  ]
+
+  let body = ''
+  for (const value of captionCandidates) {
+    const text = String(value || '').trim()
+    if (!text) continue
+    // Skip bare media URLs — those belong in mediaUrl, not as bubble text.
+    if (opts.mediaUrl && text === opts.mediaUrl) continue
+    if (/^https?:\/\/\S+$/i.test(text) && opts.mediaUrl) continue
+    body = text
+    break
+  }
+
+  if (!headerText) headerText = String(row.header_text || row.template?.header_text || '').trim() || null
+  if (!footerText) footerText = String(row.footer_text || row.template?.footer_text || '').trim() || null
+
+  return { body, headerText, footerText }
 }
 
 /**
@@ -1085,14 +1227,7 @@ function extractChatHistoryMedia(row, messageType = '') {
     row.audio?.link,
   ]
 
-  const template = row.template || row.template_data || null
-  const components = Array.isArray(template?.components)
-    ? template.components
-    : Array.isArray(row.components)
-      ? row.components
-      : Array.isArray(row.template_components)
-        ? row.template_components
-        : []
+  const components = extractTemplateComponents(row)
 
   for (const component of components) {
     const ctype = String(component?.type || '').toUpperCase()
@@ -1107,6 +1242,10 @@ function extractChatHistoryMedia(row, messageType = '') {
       if (format === 'IMAGE' || ptype === 'image') candidates.push(link)
       if (format === 'VIDEO' || ptype === 'video') candidates.push(link)
       if (format === 'DOCUMENT' || ptype === 'document') candidates.push(link)
+      if ((format === 'DOCUMENT' || ptype === 'document') && bucket?.filename) {
+        // keep filename for later
+        row._oc_doc_name = bucket.filename
+      }
     }
     const handle =
       component?.example?.header_handle ||
@@ -1115,6 +1254,10 @@ function extractChatHistoryMedia(row, messageType = '') {
       component?.link
     if (Array.isArray(handle) && handle[0]) candidates.push(handle[0])
     else if (typeof handle === 'string' && handle) candidates.push(handle)
+
+    if (format === 'DOCUMENT') row._oc_header_format = 'DOCUMENT'
+    else if (format === 'IMAGE') row._oc_header_format = row._oc_header_format || 'IMAGE'
+    else if (format === 'VIDEO') row._oc_header_format = row._oc_header_format || 'VIDEO'
   }
 
   let mediaUrl = null
@@ -1127,7 +1270,8 @@ function extractChatHistoryMedia(row, messageType = '') {
   }
 
   const mediaName = String(
-    row.document_name ||
+    row._oc_doc_name ||
+      row.document_name ||
       row.file_name ||
       row.filename ||
       row.media?.filename ||
@@ -1142,10 +1286,13 @@ function extractChatHistoryMedia(row, messageType = '') {
     .trim()
     .toLowerCase() || null
 
+  const headerFormat = String(row._oc_header_format || '').toUpperCase()
   let mediaType = null
-  if (typeHint === 'image' || typeHint === 'video' || typeHint === 'audio' || typeHint === 'document') {
-    mediaType = typeHint
-  } else if (mediaMime.startsWith('image/')) mediaType = 'image'
+  if (headerFormat === 'DOCUMENT' || typeHint === 'document') mediaType = 'document'
+  else if (headerFormat === 'VIDEO' || typeHint === 'video') mediaType = 'video'
+  else if (headerFormat === 'IMAGE' || typeHint === 'image') mediaType = 'image'
+  else if (typeHint === 'audio') mediaType = 'audio'
+  else if (mediaMime.startsWith('image/')) mediaType = 'image'
   else if (mediaMime.startsWith('video/')) mediaType = 'video'
   else if (mediaMime.startsWith('audio/')) mediaType = 'audio'
   else if (mediaMime.includes('pdf') || mediaMime.includes('document') || mediaMime.includes('msword')) {
@@ -1156,7 +1303,7 @@ function extractChatHistoryMedia(row, messageType = '') {
     else if (/\.(mp4|webm|mov|m4v)(\?|$)/i.test(u) || /\/video\//i.test(u)) mediaType = 'video'
     else if (/\.(mp3|ogg|wav|m4a|aac)(\?|$)/i.test(u) || /\/audio\//i.test(u)) mediaType = 'audio'
     else if (/\.(pdf|docx?|xlsx?|pptx?)(\?|$)/i.test(u) || mediaName) mediaType = 'document'
-    else if (typeHint === 'template') mediaType = 'image' // template headers are usually images
+    else if (typeHint === 'template') mediaType = 'document' // invoice/share templates are usually docs
     else mediaType = 'document'
   } else if (typeHint === 'template') {
     // keep null — text-only template

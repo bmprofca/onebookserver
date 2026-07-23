@@ -651,12 +651,14 @@ async function ensureSchema() {
       last_message_preview VARCHAR(500) NULL,
       last_message_status VARCHAR(20) NULL,
       last_direction VARCHAR(10) NOT NULL DEFAULT 'out',
+      token_fingerprint VARCHAR(80) NOT NULL DEFAULT '',
       created_at DATETIME(3) NOT NULL,
       updated_at DATETIME(3) NOT NULL,
-      UNIQUE KEY uq_wa_chat_phone (shop_app_id, phone_key),
+      UNIQUE KEY uq_wa_chat_phone_token (shop_app_id, phone_key, token_fingerprint),
       KEY idx_wa_chat_shop_updated (shop_app_id, last_message_at),
       KEY idx_wa_chat_shop_unread (shop_app_id, unread_count),
-      KEY idx_wa_chat_assigned (shop_app_id, assigned_user_id)
+      KEY idx_wa_chat_assigned (shop_app_id, assigned_user_id),
+      KEY idx_wa_chat_token (shop_app_id, token_fingerprint)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
