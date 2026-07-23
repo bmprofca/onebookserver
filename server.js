@@ -19,19 +19,39 @@ import {
     whatsappMessageUnitCost,
 } from './src/whatsappLogs.js';
 import {
+    broadcastWhatsAppMessages,
     createWhatsAppCampaign,
     createWhatsAppTemplate,
     deleteWhatsAppCampaign,
     deleteWhatsAppTemplate,
+    fetchRemoteWhatsAppTemplates,
     getWhatsAppConfig,
+    listWhatsAppActivities,
+    listWhatsAppTemplateVariables,
     listWhatsAppCampaigns,
     listWhatsAppChatMessages,
     listWhatsAppChats,
     listWhatsAppTemplates,
+    refreshWhatsAppConnectionStatus,
+    refreshWhatsAppTemplate,
+    resolveWhatsAppTemplateForActivity,
+    disconnectWhatsAppConfig,
+    saveWhatsAppActivityMap,
     saveWhatsAppConfig,
     sendWhatsAppCampaignMessage,
+    sendWhatsAppChatTemplate,
+    sendWhatsAppChatTextMessage,
+    sendWhatsAppChatMediaMessage,
+    syncRemoteWhatsAppTemplates,
+    syncWhatsAppInbox,
     updateWhatsAppCampaign,
     updateWhatsAppTemplate,
+    getWhatsAppChatThread,
+    markWhatsAppChatRead,
+    markWhatsAppChatUnread,
+    assignWhatsAppChat,
+    getWhatsAppLiveSession,
+    getShopWhatsAppChatCredentials,
 } from './src/whatsappManager.js';
 import {
     buildAmortizationSchedule,
@@ -1913,15 +1933,19 @@ app.put('/api/todos/:id', requireShopkeeper, (req, res) => {
     res.json({ state, todo: updated });
 });
 app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
-    if (!isPaymentReminderWhatsAppConfigured()) {
-        res.status(503).json({
-            error: 'Payment reminder WhatsApp is not configured. Set ONECHATTING_PAYMENT_REMINDER_TEMPLATE_ID (approved Meta UTILITY template) and ONECHATTING_TOKEN.',
-        });
-        return;
-    }
     const state = loadState(req.account);
     if (!state.appId) {
         res.status(400).json({ error: 'Complete shop setup first' });
+        return;
+    }
+    const shopWa = await getWhatsAppConfig(state.appId);
+    const shopMapped = shopWa.connected
+        ? await resolveWhatsAppTemplateForActivity(state.appId, 'payment_reminder')
+        : null;
+    if (!shopMapped && !isPaymentReminderWhatsAppConfigured()) {
+        res.status(503).json({
+            error: 'Payment reminder WhatsApp is not configured. Connect WhatsApp API in Settings and map Payment Reminder, or set ONECHATTING_PAYMENT_REMINDER_TEMPLATE_ID on the server.',
+        });
         return;
     }
     const shopName = String(req.body?.shopName ?? state.shopName ?? 'Shop').trim() || 'Shop';
@@ -1930,6 +1954,35 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
         res.status(400).json({ error: 'No reminders to send' });
         return;
     }
+
+    if (shopMapped) {
+        const recipients = [];
+        for (const raw of rawItems) {
+            const customerId = raw.customerId ? String(raw.customerId) : null;
+            const fromState = customerId
+                ? state.users.find((u) => u.id === customerId && u.role === 'customer')
+                : undefined;
+            const phone = String(raw.phone ?? fromState?.phone ?? '')
+                .replace(/\D/g, '')
+                .slice(-10);
+            const customerName = String(raw.customerName ?? fromState?.name ?? 'Customer').trim() || 'Customer';
+            const balance = Number(raw.balance);
+            recipients.push({ customerId, phone, customerName, balance });
+        }
+        try {
+            const result = await broadcastWhatsAppMessages(state.appId, req.account, {
+                activity: 'payment_reminder',
+                shopName,
+                recipients,
+            });
+            res.json(result);
+        }
+        catch (err) {
+            res.status(400).json({ error: err instanceof Error ? err.message : 'Could not send reminders' });
+        }
+        return;
+    }
+
     const results = [];
     for (const raw of rawItems) {
         const customerId = raw.customerId ? String(raw.customerId) : null;
@@ -1999,9 +2052,23 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
     const failed = results.length - sent;
     res.json({ ok: failed === 0, sent, failed, results });
 });
-app.get('/api/payment-reminders/status', requireShopkeeper, (_req, res) => {
+app.get('/api/payment-reminders/status', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    let shopMapped = false;
+    try {
+        if (state.appId) {
+            const shopWa = await getWhatsAppConfig(state.appId);
+            shopMapped = Boolean(
+                shopWa.connected && (await resolveWhatsAppTemplateForActivity(state.appId, 'payment_reminder')),
+            );
+        }
+    }
+    catch {
+        shopMapped = false;
+    }
     res.json({
-        configured: isPaymentReminderWhatsAppConfigured(),
+        configured: shopMapped || isPaymentReminderWhatsAppConfigured(),
+        shopMapped,
         unitCostInr: whatsappMessageUnitCost(),
     });
 });
@@ -2026,6 +2093,28 @@ app.put('/api/whatsapp/config', requireShopkeeper, async (req, res) => {
         res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save WhatsApp config' });
     }
 });
+app.post('/api/whatsapp/config/refresh', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const result = await refreshWhatsAppConnectionStatus(state.appId);
+        res.json(result);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not refresh OneChatting status' });
+    }
+});
+app.post('/api/whatsapp/config/disconnect', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    if (!requireActionConfirmCode(req, res, state))
+        return;
+    try {
+        const result = await disconnectWhatsAppConfig(state.appId);
+        res.json(result);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not disconnect OneChatting' });
+    }
+});
 app.get('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
     const state = loadState(req.account);
     try {
@@ -2033,6 +2122,94 @@ app.get('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
     }
     catch (err) {
         res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load templates' });
+    }
+});
+app.get('/api/whatsapp/remote-templates', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        res.json({ templates: await fetchRemoteWhatsAppTemplates(state.appId) });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not fetch OneChatting templates' });
+    }
+});
+app.post('/api/whatsapp/templates/sync', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const result = await syncRemoteWhatsAppTemplates(state.appId);
+        res.json(result);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not sync templates' });
+    }
+});
+app.post('/api/whatsapp/templates/:id/refresh', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const template = await refreshWhatsAppTemplate(state.appId, req.params.id);
+        res.json({ template });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not refresh template' });
+    }
+});
+app.get('/api/whatsapp/activities', requireShopkeeper, (_req, res) => {
+    res.json({
+        activities: listWhatsAppActivities(),
+        variables: listWhatsAppTemplateVariables(),
+    });
+});
+app.put('/api/whatsapp/activity-map', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const config = await saveWhatsAppActivityMap(state.appId, req.body?.activityMap || req.body || {});
+        res.json({ config });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save activity mapping' });
+    }
+});
+app.post('/api/whatsapp/activity-map/attachment', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    const activityId = String(req.body?.activityId || 'map').replace(/[^\w-]/g, '').slice(0, 40) || 'map';
+    const fileName = String(req.body?.fileName || req.body?.name || 'attachment').trim();
+    const data = String(req.body?.data || req.body?.attachmentData || '');
+    if (!fileName || !data) {
+        res.status(400).json({ error: 'Choose a file to attach' });
+        return;
+    }
+    try {
+        const saved = saveAttachmentData(`wa-${state.appId}-${activityId}`, fileName, data);
+        const host = req.get('x-forwarded-host') || req.get('host') || 'localhost:4000';
+        const proto = (req.get('x-forwarded-proto') || req.protocol || 'http').split(',')[0].trim();
+        const publicBase = (process.env.PUBLIC_BASE_URL || process.env.APP_PUBLIC_URL || `${proto}://${host}`).replace(/\/$/, '');
+        res.json({
+            name: saved.attachmentName,
+            path: saved.attachmentPath,
+            url: `${publicBase}${saved.attachmentPath}`,
+        });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save attachment' });
+    }
+});
+app.post('/api/whatsapp/broadcast', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const result = await broadcastWhatsAppMessages(state.appId, req.account, {
+            templateId: req.body?.templateId,
+            activity: req.body?.activity,
+            recipients: req.body?.recipients,
+            shopName: req.body?.shopName || state.shopName,
+            teamName: req.body?.teamName,
+            paramMode: req.body?.paramMode,
+            templateParams: req.body?.templateParams,
+            note: req.body?.note,
+        });
+        res.json(result);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Broadcast failed' });
     }
 });
 app.post('/api/whatsapp/templates', requireShopkeeper, async (req, res) => {
@@ -2123,19 +2300,185 @@ app.post('/api/whatsapp/campaigns/:id/send', requireShopkeeper, async (req, res)
 app.get('/api/whatsapp/chats', requireShopkeeper, async (req, res) => {
     const state = loadState(req.account);
     try {
-        res.json({ chats: await listWhatsAppChats(state.appId) });
+        const autoSync = String(req.query.sync || '1') !== '0';
+        let sync = null;
+        if (autoSync) {
+            // Light refresh only — full sync is via POST /chats/sync
+            sync = await syncWhatsAppInbox(state.appId, {
+                search: req.query.q ? String(req.query.q) : undefined,
+                maxPages: 1,
+                limit: 50,
+            });
+        }
+        const result = await listWhatsAppChats(state.appId, {
+            filter: String(req.query.filter || 'all'),
+            q: String(req.query.q || ''),
+            assignedTo: req.query.assignedTo ? String(req.query.assignedTo) : null,
+        });
+        res.json({ ...result, sync });
     }
     catch (err) {
         res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load chats' });
     }
 });
+app.post('/api/whatsapp/chats/sync', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const sync = await syncWhatsAppInbox(state.appId, {
+            search: req.body?.search ? String(req.body.search) : undefined,
+            maxPages: Number(req.body?.maxPages) || 3,
+            limit: Number(req.body?.limit) || 50,
+        });
+        const result = await listWhatsAppChats(state.appId, {
+            filter: String(req.body?.filter || req.query.filter || 'all'),
+            q: String(req.body?.q || req.query.q || ''),
+        });
+        res.json({ ...result, sync });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not sync chats' });
+    }
+});
+app.get('/api/whatsapp/live-session', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const session = await getWhatsAppLiveSession(state.appId);
+        res.json(session);
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Live session unavailable' });
+    }
+});
 app.get('/api/whatsapp/chats/:phone', requireShopkeeper, async (req, res) => {
     const state = loadState(req.account);
     try {
-        res.json({ messages: await listWhatsAppChatMessages(state.appId, req.params.phone) });
+        const phone = String(req.params.phone || '');
+        const creds = await getShopWhatsAppChatCredentials(state.appId);
+        const packed = await listWhatsAppChatMessages(state.appId, phone, {
+            apiKey: creds.apiKey || null,
+            countryCode: creds.countryCode || '91',
+        });
+        const thread = await getWhatsAppChatThread(state.appId, phone);
+        res.json({
+            messages: packed.messages || packed,
+            thread,
+            source: packed.source || 'local',
+            liveError: packed.liveError || null,
+            assigning: packed.assigning || null,
+            chatReady: creds.chatReady,
+        });
     }
     catch (err) {
         res.status(500).json({ error: err instanceof Error ? err.message : 'Could not load chat' });
+    }
+});
+app.post('/api/whatsapp/chats/:phone/read', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const creds = await getShopWhatsAppChatCredentials(state.appId);
+        const result = await markWhatsAppChatRead(state.appId, req.params.phone, {
+            apiKey: creds.apiKey || null,
+            countryCode: creds.countryCode || '91',
+        });
+        res.json({ thread: result.thread || result, live: result.live || null });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not mark read' });
+    }
+});
+app.post('/api/whatsapp/chats/:phone/unread', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const thread = await markWhatsAppChatUnread(state.appId, req.params.phone);
+        res.json({ thread });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not mark unread' });
+    }
+});
+app.put('/api/whatsapp/chats/:phone/assign', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const userId = req.body?.userId ? String(req.body.userId) : null;
+        let userName = req.body?.userName ? String(req.body.userName) : null;
+        if (userId && !userName) {
+            const user = (state.users || []).find((u) => u.id === userId);
+            userName = user?.name || 'Staff';
+        }
+        const thread = await assignWhatsAppChat(state.appId, req.params.phone, {
+            userId,
+            userName,
+            customerId: req.body?.customerId || null,
+            customerName: req.body?.customerName || null,
+        });
+        res.json({ thread });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not assign chat' });
+    }
+});
+app.post('/api/whatsapp/chats/:phone/send', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const phone = String(req.params.phone || req.body?.phone || '');
+        const result = await sendWhatsAppChatTemplate(state.appId, req.account, {
+            phone,
+            templateId: req.body?.templateId,
+            customerId: req.body?.customerId,
+            customerName: req.body?.customerName || req.body?.userName,
+            variables: req.body?.variables,
+            templateParams: req.body?.templateParams,
+            note: req.body?.note,
+            attachmentUrl: req.body?.attachmentUrl,
+            attachmentName: req.body?.attachmentName,
+            balance: req.body?.balance,
+            shopName: state.shopName || req.body?.shopName,
+            shopAddress: state.shopAddress || req.body?.shopAddress,
+            teamName: req.account?.name || state.shopName,
+            activity: req.body?.activity,
+        });
+        const thread = await getWhatsAppChatThread(state.appId, phone);
+        res.json({ ...result, thread });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not send message' });
+    }
+});
+app.post('/api/whatsapp/chats/:phone/send-text', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const phone = String(req.params.phone || req.body?.phone || '');
+        const result = await sendWhatsAppChatTextMessage(state.appId, req.account, {
+            phone,
+            message: req.body?.message,
+            customerId: req.body?.customerId,
+            customerName: req.body?.customerName || req.body?.userName,
+        });
+        const thread = await getWhatsAppChatThread(state.appId, phone);
+        res.json({ ...result, thread });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not send text' });
+    }
+});
+app.post('/api/whatsapp/chats/:phone/send-media', requireShopkeeper, async (req, res) => {
+    const state = loadState(req.account);
+    try {
+        const phone = String(req.params.phone || req.body?.phone || '');
+        const result = await sendWhatsAppChatMediaMessage(state.appId, req.account, {
+            phone,
+            mediaUrl: req.body?.mediaUrl || req.body?.url,
+            mediaType: req.body?.mediaType || req.body?.type,
+            caption: req.body?.caption || req.body?.message,
+            fileName: req.body?.fileName || req.body?.attachmentName,
+            customerId: req.body?.customerId,
+            customerName: req.body?.customerName || req.body?.userName,
+        });
+        const thread = await getWhatsAppChatThread(state.appId, phone);
+        res.json({ ...result, thread });
+    }
+    catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : 'Could not send media' });
     }
 });
 

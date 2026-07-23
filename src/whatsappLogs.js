@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { getPool } from './db.js'
+import { touchWhatsAppChatThread } from './whatsappChats.js'
 
 /** Estimated INR cost per successful utility template (override via env). */
 export function whatsappMessageUnitCost() {
@@ -50,7 +51,7 @@ export async function insertWhatsAppMessageLog(entry) {
       createdAt,
     ],
   )
-  return {
+  const logged = {
     id,
     shopAppId: entry.shopAppId,
     customerId: entry.customerId ?? null,
@@ -67,6 +68,28 @@ export async function insertWhatsAppMessageLog(entry) {
     sentByName: entry.sentByName ?? null,
     createdAt: createdAt.toISOString(),
   }
+  try {
+    await touchWhatsAppChatThread(
+      {
+        shopAppId: logged.shopAppId,
+        phone: logged.phone,
+        customerId: logged.customerId,
+        customerName: logged.customerName,
+        messageBody: logged.messageBody,
+        templateName: logged.templateName,
+        status: logged.status,
+        createdAt: logged.createdAt,
+        ok: entry.ok,
+      },
+      {
+        bumpUnread: entry.bumpUnread === true,
+        direction: entry.direction === 'in' ? 'in' : 'out',
+      },
+    )
+  } catch (err) {
+    console.warn('[WhatsApp] chat thread touch skipped:', err instanceof Error ? err.message : err)
+  }
+  return logged
 }
 
 /**

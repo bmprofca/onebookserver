@@ -1,6 +1,61 @@
 import 'dotenv/config';
 import mysql from 'mysql2/promise';
 let pool = null;
+
+const TRANSIENT_DB_CODES = new Set([
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'EPIPE',
+    'ETIMEDOUT',
+    'PROTOCOL_CONNECTION_LOST',
+    'PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR',
+    'PROTOCOL_ENQUEUE_AFTER_QUIT',
+    'POOL_CLOSED',
+]);
+
+function isTransientDbError(err) {
+    const code = err?.code || err?.errno;
+    const msg = String(err?.message || '');
+    if (TRANSIENT_DB_CODES.has(code))
+        return true;
+    return /ECONNRESET|Connection lost|server has gone away|socket hang up/i.test(msg);
+}
+
+function friendlyDbError(err) {
+    if (!isTransientDbError(err))
+        return err;
+    const next = new Error('Database connection was reset. Please try again.');
+    next.cause = err;
+    next.code = err?.code;
+    return next;
+}
+
+async function withDbRetry(fn, attempts = 3) {
+    let lastErr;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+            return await fn();
+        }
+        catch (err) {
+            lastErr = err;
+            if (!isTransientDbError(err) || attempt === attempts - 1) {
+                throw friendlyDbError(err);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+        }
+    }
+    throw friendlyDbError(lastErr);
+}
+
+/** Wrap pool query/execute so stale remote MySQL sockets auto-retry once or twice. */
+function wrapPoolWithRetry(rawPool) {
+    const origQuery = rawPool.query.bind(rawPool);
+    const origExecute = rawPool.execute.bind(rawPool);
+    rawPool.query = (...args) => withDbRetry(() => origQuery(...args));
+    rawPool.execute = (...args) => withDbRetry(() => origExecute(...args));
+    return rawPool;
+}
+
 export function getPool() {
     if (!pool) {
         throw new Error('Database not initialized. Call initDb() first.');
@@ -16,7 +71,7 @@ export async function initDb() {
     if (!user || !password || !database) {
         throw new Error('Missing MYSQL_USER, MYSQL_PASSWORD, or MYSQL_DATABASE in .env');
     }
-    pool = mysql.createPool({
+    pool = wrapPoolWithRetry(mysql.createPool({
         host,
         port,
         user,
@@ -24,11 +79,14 @@ export async function initDb() {
         database,
         waitForConnections: true,
         connectionLimit: 10,
+        maxIdle: 5,
+        idleTimeout: 60000,
         namedPlaceholders: true,
         timezone: 'Z',
         connectTimeout: 15000,
         enableKeepAlive: true,
-    });
+        keepAliveInitialDelay: 10000,
+    }));
     const conn = await pool.getConnection();
     try {
         await conn.ping();
@@ -532,6 +590,8 @@ async function ensureSchema() {
       phone_number_id VARCHAR(120) NULL,
       country_code VARCHAR(8) NOT NULL DEFAULT '91',
       connected TINYINT(1) NOT NULL DEFAULT 0,
+      activity_map TEXT NULL,
+      connection_status TEXT NULL,
       created_at DATETIME(3) NOT NULL,
       updated_at DATETIME(3) NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -546,6 +606,12 @@ async function ensureSchema() {
       language VARCHAR(20) NOT NULL DEFAULT 'en',
       body_text TEXT NOT NULL,
       campaign_name VARCHAR(160) NOT NULL,
+      external_id VARCHAR(120) NULL,
+      activity VARCHAR(40) NOT NULL DEFAULT 'custom',
+      header_format VARCHAR(20) NULL,
+      header_media_url TEXT NULL,
+      header_text VARCHAR(500) NULL,
+      footer_text VARCHAR(500) NULL,
       param_labels TEXT NULL,
       status VARCHAR(20) NOT NULL DEFAULT 'draft',
       created_at DATETIME(3) NOT NULL,
@@ -566,6 +632,31 @@ async function ensureSchema() {
       created_at DATETIME(3) NOT NULL,
       updated_at DATETIME(3) NOT NULL,
       KEY idx_wa_camp_shop (shop_app_id, updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_chat_threads (
+      id CHAR(36) NOT NULL PRIMARY KEY,
+      shop_app_id VARCHAR(32) NOT NULL,
+      phone VARCHAR(20) NOT NULL,
+      phone_key VARCHAR(10) NOT NULL,
+      customer_user_id CHAR(36) NULL,
+      customer_name VARCHAR(180) NOT NULL DEFAULT '',
+      assigned_user_id CHAR(36) NULL,
+      assigned_user_name VARCHAR(120) NULL,
+      unread_count INT NOT NULL DEFAULT 0,
+      last_read_at DATETIME(3) NULL,
+      last_message_at DATETIME(3) NULL,
+      last_message_preview VARCHAR(500) NULL,
+      last_message_status VARCHAR(20) NULL,
+      last_direction VARCHAR(10) NOT NULL DEFAULT 'out',
+      created_at DATETIME(3) NOT NULL,
+      updated_at DATETIME(3) NOT NULL,
+      UNIQUE KEY uq_wa_chat_phone (shop_app_id, phone_key),
+      KEY idx_wa_chat_shop_updated (shop_app_id, last_message_at),
+      KEY idx_wa_chat_shop_unread (shop_app_id, unread_count),
+      KEY idx_wa_chat_assigned (shop_app_id, assigned_user_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
 
