@@ -4,6 +4,16 @@ import { fileURLToPath } from 'node:url';
 import { v4 as uuid } from 'uuid';
 import { getDocument, getPool, initDb, setDocument } from './db.js';
 import { indiaTimestampStamp, normalizeAutoBillTime } from './time.js';
+import {
+    isLive,
+    liveOnly,
+    markDeleted,
+    normalizeRecordStatus,
+    RECORD_STATUS,
+    toClientState,
+} from './softDelete.js';
+
+export { isLive, liveOnly, markDeleted, RECORD_STATUS, toClientState } from './softDelete.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const dataDir = join(__dirname, '..', 'data');
 const shopFile = join(dataDir, 'shop.json');
@@ -111,6 +121,7 @@ export function defaultCashAccount(openingBalance = 0, createdAt, appId) {
         branch: null,
         isSystem: true,
         openingBalance,
+        status: RECORD_STATUS.ACTIVE,
         createdAt: createdAt ?? new Date().toISOString(),
     };
 }
@@ -124,6 +135,8 @@ function normalizeCashAccount(account) {
         accountNumber: account.accountNumber ?? null,
         ifscCode: account.ifscCode ?? null,
         branch: account.branch ?? null,
+        status: normalizeRecordStatus(account.status),
+        deletedAt: account.deletedAt ?? null,
     };
 }
 export function ensureCashAccounts(state) {
@@ -267,6 +280,8 @@ function normalizeState(raw) {
         email: u.email ?? null,
         role: u.role ?? 'shopkeeper',
         openingBalance: toOpeningBalance(u.openingBalance),
+        status: normalizeRecordStatus(u.status),
+        deletedAt: u.deletedAt ?? null,
     }));
     raw.transactions = (raw.transactions ?? []).map((tx) => ({
         ...tx,
@@ -276,6 +291,8 @@ function normalizeState(raw) {
         serviceName: tx.serviceName ?? null,
         loanId: tx.loanId ?? null,
         loanInstallmentId: tx.loanInstallmentId ?? null,
+        status: normalizeRecordStatus(tx.status),
+        deletedAt: tx.deletedAt ?? null,
     }));
     raw.recurringBillings = (raw.recurringBillings ?? []).map((billing) => {
         // Delay 0 is valid (same-day bill). Only missing/non-numeric counts as legacy.
@@ -311,12 +328,16 @@ function normalizeState(raw) {
             autoBillTime: normalizeAutoBillTime(billing.autoBillTime),
             active: billing.active ?? true,
             stopDate: billing.stopDate ?? null,
+            status: normalizeRecordStatus(billing.status),
+            deletedAt: billing.deletedAt ?? null,
         };
     });
     raw.services = (raw.services ?? []).map((service) => ({
         ...service,
         amount: Number(service.amount) || 0,
         description: service.description ?? '',
+        status: normalizeRecordStatus(service.status),
+        deletedAt: service.deletedAt ?? null,
     }));
     raw.todos = (raw.todos ?? []).map((todo) => ({
         ...todo,
@@ -334,6 +355,8 @@ function normalizeState(raw) {
         reminded3DaysOn: todo.reminded3DaysOn ?? null,
         reminded1DayOn: todo.reminded1DayOn ?? null,
         remindedDueOn: todo.remindedDueOn ?? null,
+        status: normalizeRecordStatus(todo.status),
+        deletedAt: todo.deletedAt ?? null,
     }));
     return ensureCashAccounts(raw);
 }
@@ -441,6 +464,16 @@ async function persistAuth(auth) {
             }
         }
 
+        const statusById = new Map();
+        const deletedAtById = new Map();
+        for (const shop of shopCaches.values()) {
+            for (const u of shop.users ?? []) {
+                statusById.set(String(u.id), normalizeRecordStatus(u.status));
+                if (u.deletedAt)
+                    deletedAtById.set(String(u.id), u.deletedAt);
+            }
+        }
+
         // Upsert first, then delete orphans — never blank-wipe.
         // Keep auth login accounts AND any shop member rows (customers may not all be in auth).
         const keepIdSet = new Set();
@@ -456,15 +489,17 @@ async function persistAuth(auth) {
         for (const a of auth.accounts) {
             const id = String(a.id);
             // Do NOT update opening_balance here — persistShop / writeCustomerOpeningBalance own it.
-            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            await conn.query(`INSERT INTO users (id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, created_at, status, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE
            name = VALUES(name),
            phone = VALUES(phone),
            email = VALUES(email),
            role = VALUES(role),
            phone_verified = VALUES(phone_verified),
-           shop_app_id = VALUES(shop_app_id)`, [
+           shop_app_id = VALUES(shop_app_id),
+           status = COALESCE(VALUES(status), status),
+           deleted_at = VALUES(deleted_at)`, [
                 id,
                 a.name,
                 a.phone,
@@ -474,6 +509,10 @@ async function persistAuth(auth) {
                 a.shopAppId,
                 openingById.has(id) ? openingById.get(id) : 0,
                 toMysqlDate(a.createdAt),
+                normalizeRecordStatus(statusById.get(id) ?? a.status),
+                statusById.get(id) === RECORD_STATUS.DELETED
+                    ? toMysqlDate(deletedAtById.get(id) || new Date().toISOString())
+                    : null,
             ]);
         }
         if (keepIds.length > 0) {
@@ -545,8 +584,8 @@ async function persistShop(state, ownerUserId) {
         for (const a of state.cashAccounts) {
             if (a.kind === 'bank' && !a.isSystem) {
                 await conn.query(`INSERT INTO bank_accounts
-            (id, shop_app_id, bank_name, account_name, account_number, ifsc_code, branch, opening_balance, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            (id, shop_app_id, bank_name, account_name, account_number, ifsc_code, branch, opening_balance, created_at, updated_at, status, deleted_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                     a.id,
                     appId,
                     a.bankName || a.name,
@@ -557,18 +596,22 @@ async function persistShop(state, ownerUserId) {
                     a.openingBalance,
                     toMysqlDate(a.createdAt),
                     toMysqlDate(new Date().toISOString()),
+                    normalizeRecordStatus(a.status),
+                    a.deletedAt ? toMysqlDate(a.deletedAt) : null,
                 ]);
             }
             else {
                 await conn.query(`INSERT INTO cash_accounts
-            (id, shop_app_id, name, kind, bank_name, account_name, account_number, is_system, opening_balance, created_at)
-           VALUES (?, ?, ?, 'cash', NULL, NULL, NULL, ?, ?, ?)`, [
+            (id, shop_app_id, name, kind, bank_name, account_name, account_number, is_system, opening_balance, created_at, status, deleted_at)
+           VALUES (?, ?, ?, 'cash', NULL, NULL, NULL, ?, ?, ?, ?, ?)`, [
                     a.id,
                     appId,
                     a.name || 'Cash',
                     a.isSystem || isSystemCashAccountId(a.id) ? 1 : 0,
                     a.openingBalance,
                     toMysqlDate(a.createdAt),
+                    normalizeRecordStatus(a.status),
+                    a.deletedAt ? toMysqlDate(a.deletedAt) : null,
                 ]);
             }
         }
@@ -583,8 +626,8 @@ async function persistShop(state, ownerUserId) {
            cash_account_id, cash_account_name,
            attachment_name, attachment_path,
            recurring_billing_id, recurring_occurrence_date,
-           service_id, service_name, loan_id, loan_installment_id, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+           service_id, service_name, loan_id, loan_installment_id, created_at, status, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 t.id,
                 appId,
                 t.type,
@@ -615,6 +658,8 @@ async function persistShop(state, ownerUserId) {
                 t.loanId ?? null,
                 t.loanInstallmentId ?? null,
                 toMysqlDate(t.createdAt),
+                normalizeRecordStatus(t.status),
+                t.deletedAt ? toMysqlDate(t.deletedAt) : null,
             ]);
         }
         await conn.query('DELETE FROM recurring_billings WHERE shop_app_id = ?', [appId]);
@@ -624,8 +669,8 @@ async function persistShop(state, ownerUserId) {
            amount, remarks, service_id, service_name, transaction_category,
            billing_interval, effective_date, next_period_start_date, last_period_start_date,
            billing_delay_days, next_run_date, last_run_date, auto_billing, auto_bill_time, active, stop_date,
-           created_by_user_id, created_by_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+           created_by_user_id, created_by_name, created_at, updated_at, status, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 billing.id,
                 appId,
                 billing.customerId,
@@ -651,13 +696,15 @@ async function persistShop(state, ownerUserId) {
                 billing.createdByName,
                 toMysqlDate(billing.createdAt),
                 toMysqlDate(billing.updatedAt),
+                normalizeRecordStatus(billing.status),
+                billing.deletedAt ? toMysqlDate(billing.deletedAt) : null,
             ]);
         }
         await conn.query('DELETE FROM shop_services WHERE shop_app_id = ?', [appId]);
         for (const service of state.services) {
             await conn.query(`INSERT INTO shop_services
-          (id, shop_app_id, name, amount, description, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`, [
+          (id, shop_app_id, name, amount, description, created_at, updated_at, status, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 service.id,
                 appId,
                 service.name,
@@ -665,6 +712,8 @@ async function persistShop(state, ownerUserId) {
                 service.description ?? '',
                 toMysqlDate(service.createdAt),
                 toMysqlDate(service.updatedAt),
+                normalizeRecordStatus(service.status),
+                service.deletedAt ? toMysqlDate(service.deletedAt) : null,
             ]);
         }
         await conn.query('DELETE FROM shop_todos WHERE shop_app_id = ?', [appId]);
@@ -674,8 +723,8 @@ async function persistShop(state, ownerUserId) {
            remind_3_days, remind_1_day, remind_due_morning, whatsapp_reminder,
            customer_user_id, customer_name, customer_phone,
            reminded_3_days_on, reminded_1_day_on, reminded_due_on,
-           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+           created_at, updated_at, status, deleted_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 todo.id,
                 appId,
                 todo.title,
@@ -696,6 +745,8 @@ async function persistShop(state, ownerUserId) {
                 todo.remindedDueOn,
                 toMysqlDate(todo.createdAt),
                 toMysqlDate(todo.updatedAt),
+                normalizeRecordStatus(todo.status),
+                todo.deletedAt ? toMysqlDate(todo.deletedAt) : null,
             ]);
         }
         await conn.query('DELETE FROM day_closes WHERE shop_app_id = ?', [appId]);
@@ -815,6 +866,8 @@ async function loadShopFromDb(appId) {
             isSystem: Boolean(a.is_system),
             openingBalance: Number(a.opening_balance),
             createdAt: fromMysqlDate(a.created_at),
+            status: normalizeRecordStatus(a.status),
+            deletedAt: a.deleted_at == null ? null : fromMysqlDate(a.deleted_at),
         })),
         ...bankRows.map((a) => {
             const bankName = String(a.bank_name);
@@ -831,6 +884,8 @@ async function loadShopFromDb(appId) {
                 isSystem: false,
                 openingBalance: Number(a.opening_balance),
                 createdAt: fromMysqlDate(a.created_at),
+                status: normalizeRecordStatus(a.status),
+                deletedAt: a.deleted_at == null ? null : fromMysqlDate(a.deleted_at),
             };
         }),
     ];
@@ -850,6 +905,8 @@ async function loadShopFromDb(appId) {
             role: u.role,
             openingBalance: toOpeningBalance(u.opening_balance),
             createdAt: fromMysqlDate(u.created_at),
+            status: normalizeRecordStatus(u.status),
+            deletedAt: u.deleted_at == null ? null : fromMysqlDate(u.deleted_at),
         })),
         cashAccounts,
         transactions: txRows.map((t) => ({
@@ -876,6 +933,8 @@ async function loadShopFromDb(appId) {
             loanId: t.loan_id == null ? null : String(t.loan_id),
             loanInstallmentId: t.loan_installment_id == null ? null : String(t.loan_installment_id),
             createdAt: fromMysqlDate(t.created_at),
+            status: normalizeRecordStatus(t.status),
+            deletedAt: t.deleted_at == null ? null : fromMysqlDate(t.deleted_at),
         })),
         recurringBillings: recurringRows.map((billing) => ({
             id: String(billing.id),
@@ -908,6 +967,8 @@ async function loadShopFromDb(appId) {
             createdByName: String(billing.created_by_name),
             createdAt: fromMysqlDate(billing.created_at),
             updatedAt: fromMysqlDate(billing.updated_at),
+            status: normalizeRecordStatus(billing.status),
+            deletedAt: billing.deleted_at == null ? null : fromMysqlDate(billing.deleted_at),
         })),
         services: serviceRows.map((service) => ({
             id: String(service.id),
@@ -916,6 +977,8 @@ async function loadShopFromDb(appId) {
             description: String(service.description ?? ''),
             createdAt: fromMysqlDate(service.created_at),
             updatedAt: fromMysqlDate(service.updated_at),
+            status: normalizeRecordStatus(service.status),
+            deletedAt: service.deleted_at == null ? null : fromMysqlDate(service.deleted_at),
         })),
         todos: todoRows.map((todo) => ({
             id: String(todo.id),
@@ -937,6 +1000,8 @@ async function loadShopFromDb(appId) {
             remindedDueOn: todo.reminded_due_on == null ? null : fromMysqlDateOnly(todo.reminded_due_on),
             createdAt: fromMysqlDate(todo.created_at),
             updatedAt: fromMysqlDate(todo.updated_at),
+            status: normalizeRecordStatus(todo.status),
+            deletedAt: todo.deleted_at == null ? null : fromMysqlDate(todo.deleted_at),
         })),
         dayCloses: dayRows.map((d) => ({
             id: String(d.id),
@@ -1254,12 +1319,14 @@ export async function phoneExistsInShop(phone, shopAppId, excludeUserId) {
         ? `SELECT id FROM users
            WHERE shop_app_id = ?
              AND role = 'customer'
+             AND IFNULL(status, 'active') <> 'deleted'
              AND RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) = ?
              AND id <> ?
            LIMIT 1`
         : `SELECT id FROM users
            WHERE shop_app_id = ?
              AND role = 'customer'
+             AND IFNULL(status, 'active') <> 'deleted'
              AND RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) = ?
            LIMIT 1`;
     const params = excludeUserId

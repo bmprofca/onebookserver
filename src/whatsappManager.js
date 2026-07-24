@@ -654,7 +654,9 @@ export async function disconnectWhatsAppConfig(shopAppId) {
 export async function listWhatsAppTemplates(shopAppId) {
   await ensureWhatsAppSchema()
   const [rows] = await getPool().query(
-    `SELECT * FROM shop_whatsapp_templates WHERE shop_app_id = ? ORDER BY updated_at DESC`,
+    `SELECT * FROM shop_whatsapp_templates
+     WHERE shop_app_id = ? AND IFNULL(status, '') <> 'deleted'
+     ORDER BY updated_at DESC`,
     [shopAppId],
   )
   return rows.map(mapTemplate)
@@ -779,8 +781,10 @@ export async function updateWhatsAppTemplate(shopAppId, id, input) {
 
 export async function deleteWhatsAppTemplate(shopAppId, id) {
   const [result] = await getPool().query(
-    `DELETE FROM shop_whatsapp_templates WHERE id = ? AND shop_app_id = ?`,
-    [id, shopAppId],
+    `UPDATE shop_whatsapp_templates
+     SET status = 'deleted', updated_at = ?
+     WHERE id = ? AND shop_app_id = ? AND status <> 'deleted'`,
+    [toMysqlDate(nowIso()), id, shopAppId],
   )
   if (!result.affectedRows) throw new Error('Template not found')
   await getPool().query(
@@ -795,7 +799,7 @@ export async function listWhatsAppCampaigns(shopAppId) {
     `SELECT c.*, t.name AS template_name
      FROM shop_whatsapp_campaigns c
      LEFT JOIN shop_whatsapp_templates t ON t.id = c.template_id
-     WHERE c.shop_app_id = ?
+     WHERE c.shop_app_id = ? AND IFNULL(c.status, '') <> 'deleted'
      ORDER BY c.updated_at DESC`,
     [shopAppId],
   )
@@ -885,8 +889,10 @@ export async function updateWhatsAppCampaign(shopAppId, id, input) {
 
 export async function deleteWhatsAppCampaign(shopAppId, id) {
   const [result] = await getPool().query(
-    `DELETE FROM shop_whatsapp_campaigns WHERE id = ? AND shop_app_id = ?`,
-    [id, shopAppId],
+    `UPDATE shop_whatsapp_campaigns
+     SET status = 'deleted', updated_at = ?
+     WHERE id = ? AND shop_app_id = ? AND status <> 'deleted'`,
+    [toMysqlDate(nowIso()), id, shopAppId],
   )
   if (!result.affectedRows) throw new Error('Campaign not found')
   return true

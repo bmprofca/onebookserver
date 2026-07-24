@@ -559,6 +559,50 @@ async function ensureSchema() {
       KEY idx_day_shop (shop_app_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+
+    // Soft-delete status on core shop records (rows stay for future recovery)
+    for (const [table, afterCol] of [
+        ['users', 'created_at'],
+        ['transactions', 'created_at'],
+        ['cash_accounts', 'created_at'],
+        ['bank_accounts', 'created_at'],
+        ['shop_services', 'updated_at'],
+        ['shop_todos', 'updated_at'],
+        ['recurring_billings', 'updated_at'],
+    ]) {
+        try {
+            await p.query(
+                `ALTER TABLE ${table} ADD COLUMN status VARCHAR(20) NOT NULL DEFAULT 'active' AFTER ${afterCol}`,
+            );
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/Duplicate column/i.test(msg)) {
+                console.warn(`[MySQL] ${table}.status migrate skipped:`, msg);
+            }
+        }
+        try {
+            await p.query(
+                `ALTER TABLE ${table} ADD COLUMN deleted_at DATETIME(3) NULL AFTER status`,
+            );
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/Duplicate column/i.test(msg)) {
+                console.warn(`[MySQL] ${table}.deleted_at migrate skipped:`, msg);
+            }
+        }
+        try {
+            await p.query(`ALTER TABLE ${table} ADD KEY idx_${table}_status (status)`);
+        }
+        catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!/Duplicate key name|already exists/i.test(msg)) {
+                // bank/cash use composite PK — index name collision OK to skip
+            }
+        }
+    }
+
     await p.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_message_logs (
       id CHAR(36) NOT NULL PRIMARY KEY,

@@ -6,6 +6,7 @@ import {
     normalizeAutoBillTime,
     toIndiaDateInput,
 } from './time.js';
+import { isLive } from './softDelete.js';
 export const RECURRING_INTERVALS = [
     'daily',
     'weekly',
@@ -223,7 +224,7 @@ export function applyResumeSchedule(schedule, { resumePeriodStart, resumeBilling
 export function materializeRecurringBillings(state, today = localDateString(), now = new Date()) {
     let created = 0;
     for (const schedule of state.recurringBillings) {
-        if (!schedule.active || !schedule.autoBilling)
+        if (!schedule.active || !schedule.autoBilling || !isLive(schedule))
             continue;
         // Never post bills after an explicit stop date (safety if still marked active).
         const stopCap = schedule.stopDate || null;

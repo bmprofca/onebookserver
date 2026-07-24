@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isSystemCashAccountId, isValidPhone, loadAuth, loadState, newId, newTxId, normalizePhone, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, writeCustomerOpeningBalance, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isLive, isSystemCashAccountId, isValidPhone, liveOnly, loadAuth, loadState, markDeleted, newId, newTxId, normalizePhone, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, toClientState, writeCustomerOpeningBalance, } from './src/store.js';
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
@@ -78,7 +78,7 @@ function resolveService(state, serviceId) {
     const id = String(serviceId ?? '').trim();
     if (!id)
         return { ok: true, service: null };
-    const service = state.services.find((item) => item.id === id) ?? null;
+    const service = liveOnly(state.services).find((item) => item.id === id) ?? null;
     if (!service)
         return { ok: false, error: 'Service not found' };
     return { ok: true, service };
@@ -235,6 +235,25 @@ async function issueOtp(phone, purpose) {
 ensureUploadsDir();
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
+/** Soft-delete: never expose status=deleted records to clients; keep them in DB/cache. */
+app.use((req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = (body) => {
+        if (body && typeof body === 'object' && body.state && Array.isArray(body.state.transactions)) {
+            const clientState = toClientState(body.state);
+            const totals = calcTotals(clientState.openingBalance, clientState.transactions);
+            const next = { ...body, state: clientState };
+            if ('totalReceipts' in body || 'totalPayments' in body || 'liveBalance' in body) {
+                next.totalReceipts = totals.totalReceipts;
+                next.totalPayments = totals.totalPayments;
+                next.liveBalance = totals.liveBalance;
+            }
+            return originalJson(next);
+        }
+        return originalJson(body);
+    };
+    next();
+});
 app.use(
     '/uploads',
     express.static(UPLOADS_DIR, { fallthrough: true }),
@@ -896,7 +915,7 @@ app.get('/api/state', requireAuth, async (req, res) => {
             res.status(403).json({ error: 'Not linked to this shop' });
             return;
         }
-        const myTx = state.transactions.filter((t) => t.customerId === account.id ||
+        const myTx = liveOnly(state.transactions).filter((t) => t.customerId === account.id ||
             t.userId === account.id ||
             (account.phone && t.customerPhone === account.phone) ||
             (account.phone && t.remarks.includes(account.phone)));
@@ -909,11 +928,11 @@ app.get('/api/state', requireAuth, async (req, res) => {
         const liveBalance = totalReceipts - totalPayments;
         res.json({
             state: {
-                ...state,
+                ...toClientState(state),
                 openingBalance: 0,
                 transactions: myTx,
-                recurringBillings: state.recurringBillings.filter((billing) => billing.customerId === account.id),
-                users: state.users.filter((u) => u.id === account.id),
+                recurringBillings: liveOnly(state.recurringBillings).filter((billing) => billing.customerId === account.id),
+                users: liveOnly(state.users).filter((u) => u.id === account.id),
                 todos: [],
                 services: [],
             },
@@ -1258,40 +1277,42 @@ app.delete('/api/users/:id', requireShopkeeper, (req, res) => {
     if (!requireActionConfirmCode(req, res, state))
         return;
     const id = String(req.params.id);
-    const target = state.users.find((u) => u.id === id);
-    if (!target) {
+    const index = state.users.findIndex((u) => u.id === id && isLive(u));
+    if (index < 0) {
         res.status(404).json({ error: 'User not found' });
         return;
     }
-    if (target.role === 'shopkeeper' && state.users.filter((u) => u.role === 'shopkeeper').length <= 1) {
+    const target = state.users[index];
+    if (target.role === 'shopkeeper' && liveOnly(state.users).filter((u) => u.role === 'shopkeeper').length <= 1) {
         res.status(400).json({ error: 'At least one shopkeeper is required' });
         return;
     }
     if (target.role === 'customer') {
-        const hasTx = state.transactions.some((t) => t.customerId === id ||
-            (target.phone && t.customerPhone === target.phone) ||
-            (target.phone && t.remarks.includes(target.phone)));
-        if (hasTx) {
-            res.status(400).json({
-                error: 'Cannot delete customer with transactions. Only customers with no entries can be removed.',
-            });
-            return;
-        }
-        if (state.recurringBillings.some((billing) => billing.customerId === id)) {
-            res.status(400).json({
-                error: 'Delete this customer’s recurring billing schedules first.',
-            });
-            return;
-        }
+        // Soft-delete linked schedules so they leave UI but stay recoverable.
+        state.recurringBillings = state.recurringBillings.map((billing) =>
+            billing.customerId === id && isLive(billing)
+                ? { ...markDeleted(billing), active: false }
+                : billing,
+        );
     }
-    state.users = state.users.filter((u) => u.id !== id);
+    // Free phone for re-use while preserving original digits on the soft-deleted row.
+    const freedPhone = target.phone;
+    state.users[index] = {
+        ...markDeleted(target),
+        phoneOriginal: freedPhone || target.phoneOriginal || null,
+        phone: `z${String(id).replace(/-/g, '').slice(0, 14)}`,
+    };
     if (state.activeUserId === id) {
-        state.activeUserId = state.users.find((u) => u.role === 'shopkeeper')?.id ?? state.users[0]?.id ?? null;
+        state.activeUserId = liveOnly(state.users).find((u) => u.role === 'shopkeeper')?.id ?? liveOnly(state.users)[0]?.id ?? null;
     }
     saveState(state, req.account);
     const auth = loadAuth();
-    auth.accounts = auth.accounts.filter((a) => a.id !== id);
+    // Keep auth account for recovery; clear sessions so deleted users cannot stay signed in.
     auth.sessions = auth.sessions.filter((s) => s.userId !== id);
+    for (const a of auth.accounts) {
+        if (a.id === id)
+            a.phone = state.users[index].phone;
+    }
     saveAuth(auth);
     res.json({ state });
 });
@@ -1304,7 +1325,7 @@ app.post('/api/recurring-billings', requireShopkeeper, (req, res) => {
     const effectiveDate = String(req.body?.effectiveDate ?? '');
     const transactionCategory = String(req.body?.transactionCategory ?? 'sales') === 'purchase' ? 'purchase' : 'sales';
     const serviceLookup = resolveService(state, req.body?.serviceId);
-    const customer = state.users.find((user) => user.id === customerId && user.role === 'customer') ?? null;
+    const customer = state.users.find((user) => user.id === customerId && user.role === 'customer' && isLive(user)) ?? null;
     if (!customer) {
         res.status(404).json({ error: 'Customer not found' });
         return;
@@ -1560,13 +1581,13 @@ app.delete('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
     if (!requireActionConfirmCode(req, res, state))
         return;
-    const exists = state.recurringBillings.some((billing) => billing.id === req.params.id);
-    if (!exists) {
+    const index = state.recurringBillings.findIndex((billing) => billing.id === req.params.id && isLive(billing));
+    if (index < 0) {
         res.status(404).json({ error: 'Recurring billing not found' });
         return;
     }
-    // Remove schedule only. Generated transactions remain normal ledger entries.
-    state.recurringBillings = state.recurringBillings.filter((billing) => billing.id !== req.params.id);
+    // Soft-delete schedule only. Generated transactions remain normal ledger entries.
+    state.recurringBillings[index] = { ...markDeleted(state.recurringBillings[index]), active: false };
     saveState(state, req.account);
     res.json({ state });
 });
@@ -1812,20 +1833,19 @@ app.delete('/api/services/:id', requireShopkeeper, (req, res) => {
     if (!requireActionConfirmCode(req, res, state))
         return;
     const id = String(req.params.id);
-    const exists = state.services.some((service) => service.id === id);
-    if (!exists) {
+    const index = state.services.findIndex((service) => service.id === id && isLive(service));
+    if (index < 0) {
         res.status(404).json({ error: 'Service not found' });
         return;
     }
-    const usedInTx = state.transactions.some((tx) => tx.serviceId === id);
-    const usedInRecurring = state.recurringBillings.some((billing) => billing.serviceId === id);
-    if (usedInTx || usedInRecurring) {
-        res.status(400).json({
-            error: 'Cannot delete this service. Entries or recurring schedules still use it. Edit instead, or remove those entries first.',
-        });
-        return;
-    }
-    state.services = state.services.filter((service) => service.id !== id);
+    const service = state.services[index];
+    // Soft-delete always allowed; free unique name for re-create.
+    const baseName = String(service.name || 'service').slice(0, 140);
+    state.services[index] = {
+        ...markDeleted(service),
+        name: `${baseName}#${id.replace(/-/g, '').slice(0, 8)}`,
+        updatedAt: new Date().toISOString(),
+    };
     saveState(state, req.account);
     res.json({ state });
 });
@@ -1982,7 +2002,7 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
         for (const raw of rawItems) {
             const customerId = raw.customerId ? String(raw.customerId) : null;
             const fromState = customerId
-                ? state.users.find((u) => u.id === customerId && u.role === 'customer')
+                ? state.users.find((u) => u.id === customerId && u.role === 'customer' && isLive(u))
                 : undefined;
             const phone = String(raw.phone ?? fromState?.phone ?? '')
                 .replace(/\D/g, '')
@@ -2009,7 +2029,7 @@ app.post('/api/payment-reminders/send', requireShopkeeper, async (req, res) => {
     for (const raw of rawItems) {
         const customerId = raw.customerId ? String(raw.customerId) : null;
         const fromState = customerId
-            ? state.users.find((u) => u.id === customerId && u.role === 'customer')
+            ? state.users.find((u) => u.id === customerId && u.role === 'customer' && isLive(u))
             : undefined;
         const phone = String(raw.phone ?? fromState?.phone ?? '')
             .replace(/\D/g, '')
@@ -2641,24 +2661,29 @@ app.post('/api/todos/bulk-delete', requireShopkeeper, (req, res) => {
         return;
     }
     const idSet = new Set(ids);
-    const before = (state.todos ?? []).length;
-    state.todos = (state.todos ?? []).filter((todo) => !idSet.has(todo.id));
-    if (state.todos.length === before) {
+    let deleted = 0;
+    state.todos = (state.todos ?? []).map((todo) => {
+        if (!idSet.has(todo.id) || !isLive(todo))
+            return todo;
+        deleted += 1;
+        return markDeleted(todo);
+    });
+    if (deleted === 0) {
         res.status(404).json({ error: 'No matching to-dos found' });
         return;
     }
     saveState(state, req.account);
-    res.json({ state, deleted: before - state.todos.length });
+    res.json({ state, deleted });
 });
 app.delete('/api/todos/:id', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
     const id = String(req.params.id);
-    const exists = (state.todos ?? []).some((todo) => todo.id === id);
-    if (!exists) {
+    const index = (state.todos ?? []).findIndex((todo) => todo.id === id && isLive(todo));
+    if (index < 0) {
         res.status(404).json({ error: 'Todo not found' });
         return;
     }
-    state.todos = state.todos.filter((todo) => todo.id !== id);
+    state.todos[index] = markDeleted(state.todos[index]);
     saveState(state, req.account);
     res.json({ state });
 });
@@ -2730,7 +2755,7 @@ app.post('/api/transactions', requireShopkeeper, (req, res) => {
     }
     let customer = null;
     if (customerId) {
-        customer = state.users.find((u) => u.id === customerId && u.role === 'customer') ?? null;
+        customer = state.users.find((u) => u.id === customerId && u.role === 'customer' && isLive(u)) ?? null;
         if (!customer) {
             res.status(404).json({ error: 'Customer not found' });
             return;
@@ -2902,7 +2927,7 @@ app.put('/api/transactions/:id', requireShopkeeper, (req, res) => {
     let customer = null;
     if (requestedCustomerId) {
         customer =
-            state.users.find((u) => u.id === requestedCustomerId && u.role === 'customer') ?? null;
+            state.users.find((u) => u.id === requestedCustomerId && u.role === 'customer' && isLive(u)) ?? null;
         if (!customer) {
             res.status(404).json({ error: 'Customer not found' });
             return;
@@ -2982,12 +3007,15 @@ app.delete('/api/transactions/:id', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
     if (!requireActionConfirmCode(req, res, state))
         return;
-    const existing = state.transactions.find((t) => t.id === req.params.id);
-    if (existing)
-        deleteAttachmentFile(existing.attachmentPath);
-    state.transactions = state.transactions.filter((t) => t.id !== req.params.id);
+    const index = state.transactions.findIndex((t) => t.id === req.params.id && isLive(t));
+    if (index < 0) {
+        res.status(404).json({ error: 'Transaction not found' });
+        return;
+    }
+    // Soft-delete keeps row + attachment path for future recovery (no file unlink).
+    state.transactions[index] = markDeleted(state.transactions[index]);
     saveState(state, req.account);
-    const totals = calcTotals(state.openingBalance, state.transactions);
+    const totals = calcTotals(state.openingBalance, liveOnly(state.transactions));
     res.json({ state, ...totals });
 });
 app.put('/api/opening-balance', requireShopkeeper, (req, res) => {
@@ -3037,7 +3065,8 @@ app.post('/api/cash-accounts', requireShopkeeper, (req, res) => {
     }
     const displayName = `${bankName} · ${accountName}`;
     const state = loadState(req.account);
-    if (state.cashAccounts.some((a) => a.kind === 'bank' &&
+    if (state.cashAccounts.some((a) => isLive(a) &&
+        a.kind === 'bank' &&
         (a.name.toLowerCase() === displayName.toLowerCase() ||
             (accountNumber &&
                 a.accountNumber &&
@@ -3069,22 +3098,23 @@ app.delete('/api/cash-accounts/:id', requireShopkeeper, (req, res) => {
     if (!requireActionConfirmCode(req, res, state))
         return;
     const id = String(req.params.id);
-    const target = state.cashAccounts.find((a) => a.id === id);
-    if (!target) {
+    const index = state.cashAccounts.findIndex((a) => a.id === id && isLive(a));
+    if (index < 0) {
         res.status(404).json({ error: 'Account not found' });
         return;
     }
+    const target = state.cashAccounts[index];
     if (target.isSystem || isSystemCashAccountId(target.id)) {
         res.status(400).json({ error: 'Cash account cannot be deleted' });
         return;
     }
-    if (state.transactions.some((t) => t.cashAccountId === id)) {
-        res.status(400).json({ error: 'Cannot delete account with transactions' });
-        return;
-    }
-    state.cashAccounts = state.cashAccounts.filter((a) => a.id !== id);
+    // Soft-delete; clear account number so a new bank row can reuse it.
+    state.cashAccounts[index] = {
+        ...markDeleted(target),
+        accountNumber: null,
+    };
     saveState(state, req.account);
-    const totals = calcTotals(state.openingBalance, state.transactions);
+    const totals = calcTotals(state.openingBalance, liveOnly(state.transactions));
     res.json({ state, ...totals });
 });
 app.post('/api/close-day', requireShopkeeper, (req, res) => {
