@@ -1,4 +1,11 @@
 import { newTxId, uniqueTxCreatedAt } from './store.js';
+import {
+    APP_TIME_ZONE,
+    indiaBillingDateTime,
+    isAutoBillTimeReached,
+    normalizeAutoBillTime,
+    toIndiaDateInput,
+} from './time.js';
 export const RECURRING_INTERVALS = [
     'daily',
     'weekly',
@@ -12,8 +19,9 @@ const MAX_OCCURRENCES_PER_RUN = 1000;
 function pad(value) {
     return String(value).padStart(2, '0');
 }
+/** Calendar day in Asia/Kolkata (YYYY-MM-DD). */
 export function localDateString(date = new Date()) {
-    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    return toIndiaDateInput(date);
 }
 export function isDateOnly(value) {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(value))
@@ -86,30 +94,32 @@ export function billingDateForPeriod(periodStartDate, interval, delayDays) {
     return addDays(periodEndDate(periodStartDate, interval), delayDays);
 }
 export function recurringPeriodLabel(periodStartDate, interval) {
-    const start = new Date(`${periodStartDate}T12:00:00`);
-    const month = start.toLocaleString('en-IN', { month: 'short' });
-    const year = start.getFullYear();
+    const start = new Date(`${periodStartDate}T12:00:00+05:30`);
+    const month = start.toLocaleString('en-IN', { timeZone: APP_TIME_ZONE, month: 'short' });
+    const year = Number(toIndiaDateInput(start).slice(0, 4));
+    const day = Number(toIndiaDateInput(start).slice(8, 10));
+    const monthIndex = Number(toIndiaDateInput(start).slice(5, 7)) - 1;
     if (interval === 'daily')
         return localDateString(start);
     if (interval === 'weekly') {
         return `${localDateString(start)} to ${periodEndDate(periodStartDate, interval)}`;
     }
     if (interval === 'every_15_days') {
-        return `${start.getDate() <= 15 ? '1–15' : '16–end'} ${month} ${year}`;
+        return `${day <= 15 ? '1–15' : '16–end'} ${month} ${year}`;
     }
     if (interval === 'monthly')
         return `${month} ${year}`;
     if (interval === 'quarterly')
-        return `Q${Math.floor(start.getMonth() / 3) + 1} ${year}`;
+        return `Q${Math.floor(monthIndex / 3) + 1} ${year}`;
     if (interval === 'half_yearly')
-        return `${start.getMonth() < 6 ? 'H1' : 'H2'} ${year}`;
+        return `${monthIndex < 6 ? 'H1' : 'H2'} ${year}`;
     return String(year);
 }
 function generatedTransaction(state, schedule, billingDate, periodStartDate, postedAt = new Date()) {
     // Manual: sales/purchase date = when the user posts (editable later in Entry/Sales).
-    // Auto: keep the scheduled billing calendar day for catch-up posts.
+    // Auto: use billing day + configured auto bill time (IST).
     const baseDate = schedule.autoBilling
-        ? new Date(`${billingDate}T12:00:00`)
+        ? indiaBillingDateTime(billingDate, schedule.autoBillTime)
         : postedAt;
     const createdAt = uniqueTxCreatedAt(state.transactions, baseDate);
     let id = newTxId(new Date(createdAt));
@@ -209,8 +219,8 @@ export function applyResumeSchedule(schedule, { resumePeriodStart, resumeBilling
     return schedule;
 }
 
-/** Post all due auto-billing schedules (nextRunDate <= today). Called on GET /api/state and after create/update/resume. Manual schedules are never touched here — they appear on the client Pending bill card. */
-export function materializeRecurringBillings(state, today = localDateString()) {
+/** Post all due auto-billing schedules (nextRunDate <= today, and time reached on billing day). Called on GET /api/state and after create/update/resume. Manual schedules are never touched here — they appear on the client Pending bill card. */
+export function materializeRecurringBillings(state, today = localDateString(), now = new Date()) {
     let created = 0;
     for (const schedule of state.recurringBillings) {
         if (!schedule.active || !schedule.autoBilling)
@@ -218,10 +228,16 @@ export function materializeRecurringBillings(state, today = localDateString()) {
         // Never post bills after an explicit stop date (safety if still marked active).
         const stopCap = schedule.stopDate || null;
         let guard = 0;
-        while (schedule.nextRunDate <= today && guard < MAX_OCCURRENCES_PER_RUN) {
+        while (
+            isAutoBillTimeReached(schedule.nextRunDate, schedule.autoBillTime, now) &&
+            guard < MAX_OCCURRENCES_PER_RUN
+        ) {
             if (stopCap && schedule.nextRunDate > stopCap)
                 break;
-            if (postNextRecurringBill(state, schedule))
+            // Safety: never post future calendar days
+            if (schedule.nextRunDate > today)
+                break;
+            if (postNextRecurringBill(state, schedule, now))
                 created += 1;
             guard += 1;
         }
@@ -249,6 +265,7 @@ export function createRecurringBilling(input) {
         nextRunDate: input.billingDate,
         lastRunDate: null,
         autoBilling: input.autoBilling,
+        autoBillTime: normalizeAutoBillTime(input.autoBillTime),
         active: true,
         stopDate: null,
         createdByUserId: input.account.id,

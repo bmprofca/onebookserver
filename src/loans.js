@@ -327,13 +327,13 @@ export async function createCustomerLoan(state, account, input) {
     )
   }
 
-  // Backdated loans: post every EMI whose ledger date (due − 2 days) is already due.
+  // Backdated loans: post every EMI whose ledger date is already due.
   await materializeLoanEmis(state, dateOnly())
 
   return getLoanWithSchedule(state.appId, loanId)
 }
 
-/** Post EMIs to ledger 2 days before due date (catch-up for past loans included). */
+/** Post EMIs to ledger when interest ledger date is reached (month-end for monthly, due day for weekly). */
 export async function materializeLoanEmis(state, today = dateOnly()) {
   if (!state.appId) return 0
   const [pendingRows] = await getPool().query(

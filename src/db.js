@@ -431,6 +431,7 @@ async function ensureSchema() {
       next_run_date DATE NOT NULL,
       last_run_date DATE NULL,
       auto_billing TINYINT(1) NOT NULL DEFAULT 1,
+      auto_bill_time CHAR(5) NOT NULL DEFAULT '09:00',
       active TINYINT(1) NOT NULL DEFAULT 1,
       created_by_user_id CHAR(36) NOT NULL,
       created_by_name VARCHAR(120) NOT NULL,
@@ -449,6 +450,7 @@ async function ensureSchema() {
         `ADD COLUMN last_period_start_date DATE NULL AFTER next_period_start_date`,
         `ADD COLUMN billing_delay_days INT NOT NULL DEFAULT 0 AFTER last_period_start_date`,
         `ADD COLUMN auto_billing TINYINT(1) NOT NULL DEFAULT 1 AFTER last_run_date`,
+        `ADD COLUMN auto_bill_time CHAR(5) NOT NULL DEFAULT '09:00' AFTER auto_billing`,
         `ADD COLUMN stop_date DATE NULL AFTER active`,
     ]) {
         try {

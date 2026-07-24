@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { v4 as uuid } from 'uuid';
 import { getDocument, getPool, initDb, setDocument } from './db.js';
+import { indiaTimestampStamp, normalizeAutoBillTime } from './time.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const dataDir = join(__dirname, '..', 'data');
 const shopFile = join(dataDir, 'shop.json');
@@ -307,6 +308,7 @@ function normalizeState(raw) {
             nextRunDate,
             lastRunDate: billing.lastRunDate ?? null,
             autoBilling: billing.autoBilling ?? true,
+            autoBillTime: normalizeAutoBillTime(billing.autoBillTime),
             active: billing.active ?? true,
             stopDate: billing.stopDate ?? null,
         };
@@ -621,9 +623,9 @@ async function persistShop(state, ownerUserId) {
           (id, shop_app_id, customer_user_id, customer_name, customer_phone,
            amount, remarks, service_id, service_name, transaction_category,
            billing_interval, effective_date, next_period_start_date, last_period_start_date,
-           billing_delay_days, next_run_date, last_run_date, auto_billing, active, stop_date,
+           billing_delay_days, next_run_date, last_run_date, auto_billing, auto_bill_time, active, stop_date,
            created_by_user_id, created_by_name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 billing.id,
                 appId,
                 billing.customerId,
@@ -642,6 +644,7 @@ async function persistShop(state, ownerUserId) {
                 billing.nextRunDate,
                 billing.lastRunDate,
                 billing.autoBilling ? 1 : 0,
+                normalizeAutoBillTime(billing.autoBillTime),
                 billing.active ? 1 : 0,
                 billing.stopDate ?? null,
                 billing.createdByUserId,
@@ -898,6 +901,7 @@ async function loadShopFromDb(appId) {
                 ? null
                 : fromMysqlDateOnly(billing.last_run_date),
             autoBilling: Boolean(billing.auto_billing),
+            autoBillTime: normalizeAutoBillTime(billing.auto_bill_time),
             active: Boolean(billing.active),
             stopDate: billing.stop_date == null ? null : fromMysqlDateOnly(billing.stop_date),
             createdByUserId: String(billing.created_by_user_id),
@@ -1219,11 +1223,9 @@ export async function flushStore() {
 export function newId() {
     return uuid();
 }
-/** Unique transaction id embedding local timestamp + random suffix (fits CHAR(36)). */
+/** Unique transaction id embedding IST timestamp + random suffix (fits CHAR(36)). */
 export function newTxId(at = new Date()) {
-    const p = (n, w) => String(n).padStart(w, '0');
-    const stamp = `${at.getFullYear()}${p(at.getMonth() + 1, 2)}${p(at.getDate(), 2)}` +
-        `${p(at.getHours(), 2)}${p(at.getMinutes(), 2)}${p(at.getSeconds(), 2)}${p(at.getMilliseconds(), 3)}`;
+    const stamp = indiaTimestampStamp(at);
     const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
     return `TX${stamp}${rand}`;
 }

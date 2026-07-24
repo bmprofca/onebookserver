@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import './src/time.js';
 import cors from 'cors';
 import express from 'express';
 import fs from 'node:fs';
@@ -9,6 +10,7 @@ import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, en
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
+import { indiaTodayDateInput, normalizeAutoBillTime } from './src/time.js';
 import { applyResumeSchedule, billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isBillingDateAllowed, isDateOnly, lastGeneratedBillDate, localDateString, materializeRecurringBillings, minResumeBillingDate, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
 import { buildJoinPageHtml } from './src/joinPageHtml.js';
 import { getAppVersionInfo } from './src/appVersion.js';
@@ -1338,6 +1340,7 @@ app.post('/api/recurring-billings', requireShopkeeper, (req, res) => {
     if (billingDate < today) {
         autoBilling = false;
     }
+    const autoBillTime = normalizeAutoBillTime(req.body?.autoBillTime);
     const billing = createRecurringBilling({
         account: req.account,
         customer,
@@ -1348,6 +1351,7 @@ app.post('/api/recurring-billings', requireShopkeeper, (req, res) => {
         billingDate,
         transactionCategory,
         autoBilling,
+        autoBillTime,
         serviceId: serviceLookup.service?.id ?? null,
         serviceName: serviceLookup.service?.name ?? null,
     });
@@ -1379,6 +1383,9 @@ app.put('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
             ? 'purchase'
             : 'sales';
     let autoBilling = req.body?.autoBilling === undefined ? current.autoBilling : Boolean(req.body.autoBilling);
+    const autoBillTime = req.body?.autoBillTime === undefined
+        ? normalizeAutoBillTime(current.autoBillTime)
+        : normalizeAutoBillTime(req.body.autoBillTime);
     const serviceLookup = resolveService(state, req.body?.serviceId === undefined ? current.serviceId : req.body.serviceId);
     if (!serviceLookup.ok) {
         res.status(404).json({ error: serviceLookup.error });
@@ -1435,6 +1442,7 @@ app.put('/api/recurring-billings/:id', requireShopkeeper, (req, res) => {
         // Always apply bill/due date when the schedule definition or due date changed.
         nextRunDate: scheduleChanged ? billingDate : current.nextRunDate,
         autoBilling,
+        autoBillTime,
         updatedAt: new Date().toISOString(),
     };
     state.recurringBillings[index] = updated;
@@ -2606,9 +2614,7 @@ app.post('/api/todos/reminders/ack', requireShopkeeper, (req, res) => {
         res.json({ state });
         return;
     }
-    const today = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    const todayStr = `${today.getFullYear()}-${pad(today.getMonth() + 1)}-${pad(today.getDate())}`;
+    const todayStr = indiaTodayDateInput();
     let changed = false;
     state.todos = (state.todos ?? []).map((todo) => {
         const match = items.find((item) => item.id === todo.id && item.kind);

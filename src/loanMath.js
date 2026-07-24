@@ -2,15 +2,23 @@
  * Customer loan / sale-on-EMI helpers.
  * Interest: flat | reducing
  * Frequency: monthly | weekly
- * Interest posts on the last day of each EMI period.
+ *
+ * Monthly: EMI due 1st of month · interest ledger last day of prior month.
+ * Weekly: EMI every Monday (skip first Monday after sale) · interest on due day.
  */
+
+import { toIndiaDateInput } from './time.js'
 
 function pad(n) {
   return String(n).padStart(2, '0')
 }
 
+function parseDate(dateStr) {
+  return new Date(`${String(dateStr).slice(0, 10)}T12:00:00`)
+}
+
 export function dateOnly(date = new Date()) {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  return toIndiaDateInput(date)
 }
 
 export function lastDayOfMonth(year, monthIndex) {
@@ -28,8 +36,29 @@ export function asDateOnly(value) {
 }
 
 export function addDays(dateStr, days) {
-  const d = new Date(`${dateStr}T12:00:00`)
+  const d = parseDate(dateStr)
   d.setDate(d.getDate() + days)
+  return dateOnly(d)
+}
+
+function daysBetween(from, to) {
+  const a = parseDate(from).getTime()
+  const b = parseDate(to).getTime()
+  return Math.round((b - a) / 86_400_000)
+}
+
+function firstOfMonth(year, monthIndex) {
+  return dateOnly(new Date(year, monthIndex, 1, 12))
+}
+
+function nextMonthFirst(year, monthIndex) {
+  return firstOfMonth(year, monthIndex + 1)
+}
+
+/** Monday on or after date (includes date when already Monday). */
+function firstMondayOnOrAfter(dateStr) {
+  const d = parseDate(dateStr)
+  while (d.getDay() !== 1) d.setDate(d.getDate() + 1)
   return dateOnly(d)
 }
 
@@ -55,50 +84,61 @@ export function normalizeEmiFrequency(value) {
 
 /**
  * Interest post date on customer ledger.
- * Monthly → 1 day before EMI due (30th day when due is sale+30)
- * Weekly → last day of the 7-day period (= EMI due, date-to-date)
+ * Monthly → last day of month before EMI due (EMI is on 1st).
+ * Weekly → EMI due (Monday).
  */
 export function emiLedgerDate(dueDate, frequency = 'monthly') {
   const due = String(dueDate).slice(0, 10)
   if (normalizeEmiFrequency(frequency) === 'weekly') return due
-  return addDays(due, -1)
+  const d = parseDate(due)
+  return lastDayOfMonth(d.getFullYear(), d.getMonth() - 1)
 }
 
 /**
- * Default first EMI due date.
- * Monthly → sale + 30 days · Weekly → sale + 7 days (date-to-date).
+ * Default first EMI due date from sale date.
+ * Monthly → 1st of next month; if sale→that date < 15 days, 1st of month after.
+ * Weekly → second Monday after sale (skip first Monday on/after sale).
  */
 export function defaultEmiStartDate(loanDate, frequency = 'monthly') {
   const from = String(loanDate).slice(0, 10)
   const freq = normalizeEmiFrequency(frequency)
-  if (freq === 'weekly') return addDays(from, 7)
-  return addDays(from, 30)
+  if (freq === 'weekly') {
+    const firstMon = firstMondayOnOrAfter(from)
+    return addDays(firstMon, 7)
+  }
+  const d = parseDate(from)
+  let candidate = nextMonthFirst(d.getFullYear(), d.getMonth())
+  if (daysBetween(from, candidate) < 15) {
+    candidate = nextMonthFirst(d.getFullYear(), d.getMonth() + 1)
+  }
+  return candidate
 }
 
-/**
- * Period end / EMI due date from period start.
- * For both monthly and weekly, periodStart is the due date in the +N day chain.
- */
+/** EMI due date for a period start (already normalized). */
 export function periodEndDate(periodStart, frequency = 'monthly') {
   return String(periodStart).slice(0, 10)
 }
 
 /**
- * Next EMI due after the previous due date.
- * Monthly → +30 days · Weekly → +7 days.
+ * Next EMI due after previous due.
+ * Monthly → 1st of next month · Weekly → +7 days (Monday chain).
  */
 export function nextPeriodStartAfter(periodEnd, frequency = 'monthly') {
   const end = String(periodEnd).slice(0, 10)
   const freq = normalizeEmiFrequency(frequency)
   if (freq === 'weekly') return addDays(end, 7)
-  return addDays(end, 30)
+  const d = parseDate(end)
+  return nextMonthFirst(d.getFullYear(), d.getMonth())
 }
 
-/**
- * First EMI due date — keep as entered (sale+30 / sale+7 by default).
- */
+/** Snap due date to 1st (monthly) or Monday (weekly). */
 export function normalizePeriodStart(emiStartDate, frequency = 'monthly') {
-  return String(emiStartDate).slice(0, 10)
+  const date = String(emiStartDate).slice(0, 10)
+  const freq = normalizeEmiFrequency(frequency)
+  if (freq === 'weekly') return firstMondayOnOrAfter(date)
+  const d = parseDate(date)
+  if (d.getDate() === 1) return firstOfMonth(d.getFullYear(), d.getMonth())
+  return nextMonthFirst(d.getFullYear(), d.getMonth())
 }
 
 /** Periods per year for rate math. */
@@ -178,7 +218,10 @@ export function buildAmortizationSchedule(
   const freq = normalizeEmiFrequency(frequency)
   const emi = calculateEmi(P0, annual, n, type, freq)
 
-  let periodStart = normalizePeriodStart(emiStartDate || defaultEmiStartDate(dateOnly(), freq), freq)
+  let periodStart = normalizePeriodStart(
+    emiStartDate || defaultEmiStartDate(dateOnly(), freq),
+    freq,
+  )
   const rows = []
 
   if (type === 'flat') {
@@ -240,6 +283,6 @@ export function firstEmiDueDate(emiStartDate) {
 
 /** @deprecated */
 export function addMonthsMonthEnd(dueDate, months) {
-  const d = new Date(`${dueDate}T12:00:00`)
+  const d = parseDate(dueDate)
   return lastDayOfMonth(d.getFullYear(), d.getMonth() + months)
 }
