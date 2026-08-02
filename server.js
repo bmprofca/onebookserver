@@ -15,6 +15,7 @@ import {
     recordLoginEvent,
     registerAdminPanelRoutes,
 } from './src/adminPanel.js';
+import { ensurePlatformWalletSchema } from './src/platformWallet.js';
 import { indiaTodayDateInput, normalizeAutoBillTime } from './src/time.js';
 import { applyResumeSchedule, billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isBillingDateAllowed, isDateOnly, lastGeneratedBillDate, localDateString, materializeRecurringBillings, minResumeBillingDate, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
 import { buildJoinPageHtml } from './src/joinPageHtml.js';
@@ -3254,6 +3255,7 @@ async function main() {
     try {
         await initStore();
         await ensureAdminSchema();
+        await ensurePlatformWalletSchema();
     }
     catch (err) {
         const message = err instanceof Error ? err.message : String(err);

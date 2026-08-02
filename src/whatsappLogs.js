@@ -1,12 +1,9 @@
 import { randomUUID } from 'node:crypto'
 import { getPool } from './db.js'
 import { touchWhatsAppChatThread } from './whatsappChats.js'
+import { whatsappMessageUnitCost } from './platformWallet.js'
 
-/** Estimated INR cost per successful utility template (override via env). */
-export function whatsappMessageUnitCost() {
-  const n = Number(process.env.WHATSAPP_MESSAGE_COST_INR ?? 0.75)
-  return Number.isFinite(n) && n >= 0 ? n : 0.75
-}
+export { whatsappMessageUnitCost }
 
 /**
  * @param {object} entry

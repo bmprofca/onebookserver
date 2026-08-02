@@ -15,6 +15,13 @@ import {
   saveAuth,
   saveState,
 } from './store.js'
+import {
+  adjustShopWallet,
+  getPlatformPricing,
+  listShopWallets,
+  shopWalletLedger,
+  updatePlatformPricing,
+} from './platformWallet.js'
 
 const ADMIN_SESSION_MS = 1000 * 60 * 60 * 12 // 12 hours
 const OTP_TTL_MS = 1000 * 60 * 5
@@ -1002,5 +1009,70 @@ export function registerAdminPanelRoutes(app, deps) {
             : new Date(r.created_at).toISOString(),
       })),
     })
+  })
+
+  app.get('/api/admin/wallet/pricing', requireAdminAuth, async (_req, res) => {
+    try {
+      const pricing = await getPlatformPricing()
+      res.json({ pricing })
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load pricing' })
+    }
+  })
+
+  app.put('/api/admin/wallet/pricing', requireAdminAuth, async (req, res) => {
+    try {
+      const pricing = await updatePlatformPricing({
+        messagingCostInr: req.body?.messagingCostInr,
+        subscriptionMonthlyInr: req.body?.subscriptionMonthlyInr,
+        subscriptionYearlyInr: req.body?.subscriptionYearlyInr,
+        notes: req.body?.notes,
+      })
+      res.json({
+        pricing,
+        message: 'Pricing saved. Messaging cost applies to new WhatsApp sends. Subscription billing will use these rates when enabled.',
+      })
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Could not save pricing' })
+    }
+  })
+
+  app.get('/api/admin/wallet/shops', requireAdminAuth, async (req, res) => {
+    try {
+      const q = String(req.query.q || '').trim()
+      const shops = await listShopWallets(q)
+      res.json({ shops })
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load wallets' })
+    }
+  })
+
+  app.post('/api/admin/wallet/shops/:appId/adjust', requireAdminAuth, async (req, res) => {
+    try {
+      const result = await adjustShopWallet({
+        shopAppId: req.params.appId,
+        amountInr: req.body?.amountInr,
+        kind: req.body?.kind,
+        note: req.body?.note,
+        createdByPhone: req.admin?.phone,
+      })
+      res.json({
+        ...result,
+        message: 'Wallet updated. Auto-debit for messaging/subscription is not live yet.',
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Wallet adjust failed'
+      const status = /not found|Insufficient|required|positive/i.test(message) ? 400 : 500
+      res.status(status).json({ error: message })
+    }
+  })
+
+  app.get('/api/admin/wallet/shops/:appId/ledger', requireAdminAuth, async (req, res) => {
+    try {
+      const ledger = await shopWalletLedger(req.params.appId, req.query.limit)
+      res.json({ ledger })
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to load ledger' })
+    }
   })
 }
