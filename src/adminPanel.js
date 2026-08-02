@@ -930,6 +930,17 @@ export function registerAdminPanelRoutes(app, deps) {
       loginRows = rows
     }
 
+    let walletBalanceInr = 0
+    try {
+      const [walletRows] = await p.query(
+        `SELECT balance_inr FROM shop_wallets WHERE shop_app_id = ? LIMIT 1`,
+        [appId],
+      )
+      walletBalanceInr = walletRows[0] ? Number(walletRows[0].balance_inr) || 0 : 0
+    } catch {
+      walletBalanceInr = 0
+    }
+
     res.json({
       business: {
         appId: String(shop.app_id),
@@ -938,6 +949,7 @@ export function registerAdminPanelRoutes(app, deps) {
         setupComplete: Boolean(shop.setup_complete),
         openingBalance,
         liveBalance: openingBalance + totalPayments - totalReceipts,
+        walletBalanceInr,
         totalReceipts,
         totalPayments,
         transactionCount: Number(txAgg.transaction_count) || 0,
