@@ -887,6 +887,42 @@ export function registerAdminPanelRoutes(app, deps) {
       ]),
     )
 
+    const memberIds = [
+      ...(owner ? [owner.id] : []),
+      ...customerRows.map((r) => String(r.id)),
+    ]
+    const memberPhones = [
+      ...(owner?.phone ? [owner.phone] : []),
+      ...customerRows.map((r) => String(r.phone || '')).filter(Boolean),
+    ]
+    let loginRows = []
+    if (memberIds.length > 0 || memberPhones.length > 0) {
+      const idPlaceholders = memberIds.length ? memberIds.map(() => '?').join(',') : null
+      const phonePlaceholders = memberPhones.length ? memberPhones.map(() => '?').join(',') : null
+      const loginWhere = []
+      const loginParams = []
+      if (idPlaceholders) {
+        loginWhere.push(`h.user_id IN (${idPlaceholders})`)
+        loginParams.push(...memberIds)
+      }
+      if (phonePlaceholders) {
+        loginWhere.push(`h.phone IN (${phonePlaceholders})`)
+        loginParams.push(...memberPhones)
+      }
+      loginParams.push(200)
+      const [rows] = await p.query(
+        `SELECT h.id, h.user_id, h.phone, h.role, h.event, h.ip, h.user_agent, h.created_at,
+                u.name AS user_name
+         FROM login_history h
+         LEFT JOIN users u ON u.id = h.user_id
+         WHERE (${loginWhere.join(' OR ')})
+         ORDER BY h.created_at DESC
+         LIMIT ?`,
+        loginParams,
+      )
+      loginRows = rows
+    }
+
     res.json({
       business: {
         appId: String(shop.app_id),
@@ -900,6 +936,7 @@ export function registerAdminPanelRoutes(app, deps) {
         transactionCount: Number(txAgg.transaction_count) || 0,
         customerCount: customerRows.length,
         messageCount: msgRows.length,
+        loginCount: loginRows.length,
         owner,
         createdAt:
           shop.created_at instanceof Date
@@ -949,6 +986,20 @@ export function registerAdminPanelRoutes(app, deps) {
           row.created_at instanceof Date
             ? row.created_at.toISOString()
             : new Date(row.created_at).toISOString(),
+      })),
+      loginHistory: loginRows.map((r) => ({
+        id: Number(r.id),
+        userId: r.user_id == null ? null : String(r.user_id),
+        userName: r.user_name == null ? null : String(r.user_name),
+        phone: String(r.phone),
+        role: r.role == null ? null : String(r.role),
+        event: String(r.event),
+        ip: r.ip == null ? null : String(r.ip),
+        userAgent: r.user_agent == null ? null : String(r.user_agent),
+        createdAt:
+          r.created_at instanceof Date
+            ? r.created_at.toISOString()
+            : new Date(r.created_at).toISOString(),
       })),
     })
   })
