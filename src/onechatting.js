@@ -80,9 +80,13 @@ async function listApprovedTemplates(baseUrl, token, category, status = 'APPROVE
     page_no: '1',
     limit: '100',
   })
-  const res = await fetchWithRetry(`${baseUrl}/developer/template/template-list?${query}`, {
-    headers: { token },
-  })
+  const res = await fetchWithRetry(
+    `${baseUrl}/developer/template/template-list?${query}`,
+    {
+      headers: { token },
+    },
+    { retries: 1, timeoutMs: 10000 },
+  )
   const raw = await res.text()
   let data
   try {
@@ -823,6 +827,48 @@ async function sendTemplateMessage(phone10, templateRef, bodyTexts, categories, 
 /**
  * Send an AUTHENTICATION OTP template via OneChatting.
  */
+const otpTemplateIdCache = new Map()
+
+function looksLikeOneChattingTemplateId(ref) {
+  // Real template ids are long opaque strings; names are short like "login_otp".
+  return /^[a-z0-9]{24,}$/i.test(String(ref || '').trim())
+}
+
+async function resolveOtpTemplateId(templateRef) {
+  const ref = String(templateRef || '').trim()
+  if (!ref) return null
+  if (looksLikeOneChattingTemplateId(ref)) return ref
+  const cached = otpTemplateIdCache.get(ref)
+  if (cached) return cached
+
+  const token = process.env.ONECHATTING_TOKEN?.trim()
+  const baseUrl = oneChattingBaseUrl()
+  if (!token) return ref
+
+  try {
+    // Short, single-attempt lookup by name — avoids the old multi-minute hang.
+    const templates = await listApprovedTemplates(baseUrl, token, 'AUTHENTICATION')
+    const match = templates.find(
+      (template) =>
+        template.template_id === ref ||
+        (String(template.template_name || '') === ref &&
+          String(template.status || '').toUpperCase() === 'APPROVED'),
+    )
+    const id = match?.template_id ? String(match.template_id) : null
+    if (id) {
+      otpTemplateIdCache.set(ref, id)
+      console.log(`[OneChatting] OTP template "${ref}" → ${id}`)
+      return id
+    }
+  } catch (err) {
+    console.warn(
+      `[OneChatting] OTP template name lookup failed for "${ref}":`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+  return ref
+}
+
 export async function sendWhatsAppOtp(phone10, otpCode) {
   const templateRef = process.env.ONECHATTING_OTP_TEMPLATE_ID?.trim()
   if (!templateRef) {
@@ -834,10 +880,11 @@ export async function sendWhatsAppOtp(phone10, otpCode) {
   if (!/^\d{4,8}$/.test(otpCode)) {
     return { ok: false, error: 'OTP must be 4–8 digits for WhatsApp AUTHENTICATION templates' }
   }
-  return sendTemplateMessage(phone10, templateRef, [otpCode], ['AUTHENTICATION'], {
+  const templateId = await resolveOtpTemplateId(templateRef)
+  return sendTemplateMessage(phone10, templateId, [otpCode], ['AUTHENTICATION'], {
     retries: 1,
     timeoutMs: 10000,
-    // Never list templates for OTP — listing is slow and often blocked for User Tokens.
+    // ID already resolved (or is a raw id) — do not list templates again.
     assumeId: true,
   })
 }

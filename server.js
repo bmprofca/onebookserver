@@ -312,7 +312,12 @@ function requireActionConfirmCode(req, res, state) {
     return true;
 }
 app.get('/api/health', (_req, res) => {
-    res.json({ ok: true, openingBalance: true });
+    res.json({
+        ok: true,
+        openingBalance: true,
+        build: process.env.ONEBOOK_BUILD || '2026-08-02-otp-fix',
+        otpFix: true,
+    });
 });
 
 /** Public: latest Android/app build for in-app update prompt. */
