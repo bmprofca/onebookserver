@@ -514,6 +514,19 @@ async function persistAuth(auth) {
                     ? toMysqlDate(deletedAtById.get(id) || new Date().toISOString())
                     : null,
             ]);
+            if (a.role === 'shopkeeper' && a.phone) {
+                const phoneKey = normalizePhone(a.phone);
+                if (/^\d{10}$/.test(phoneKey)) {
+                    await conn.query(
+                        `INSERT INTO shopkeeper_phones (phone, user_id, shop_app_id, created_at)
+                         VALUES (?, ?, ?, UTC_TIMESTAMP(3))
+                         ON DUPLICATE KEY UPDATE
+                           user_id = VALUES(user_id),
+                           shop_app_id = COALESCE(VALUES(shop_app_id), shop_app_id)`,
+                        [phoneKey, id, a.shopAppId ? String(a.shopAppId) : null],
+                    );
+                }
+            }
         }
         if (keepIds.length > 0) {
             const placeholders = keepIds.map(() => '?').join(',');
@@ -788,6 +801,19 @@ async function persistShop(state, ownerUserId) {
                 toOpeningBalance(u.openingBalance),
                 toMysqlDate(u.createdAt),
             ]);
+            if (u.role === 'shopkeeper' && u.phone) {
+                const phoneKey = normalizePhone(u.phone);
+                if (/^\d{10}$/.test(phoneKey)) {
+                    await conn.query(
+                        `INSERT INTO shopkeeper_phones (phone, user_id, shop_app_id, created_at)
+                         VALUES (?, ?, ?, UTC_TIMESTAMP(3))
+                         ON DUPLICATE KEY UPDATE
+                           user_id = VALUES(user_id),
+                           shop_app_id = COALESCE(VALUES(shop_app_id), shop_app_id)`,
+                        [phoneKey, String(u.id), String(appId)],
+                    );
+                }
+            }
         }
         await conn.commit();
     }
@@ -1334,6 +1360,94 @@ export async function phoneExistsInShop(phone, shopAppId, excludeUserId) {
         : [shopAppId, normalized];
     const [rows] = await getPool().query(sql, params);
     return rows.length > 0;
+}
+
+export const SHOPKEEPER_AS_CUSTOMER_ERROR =
+    'This mobile is registered as a business admin and cannot be added as a customer';
+
+/** Register a shopkeeper phone in the durable blocklist registry. */
+export async function registerShopkeeperPhone(phone, userId, shopAppId = null) {
+    const normalized = normalizePhone(phone);
+    if (!/^\d{10}$/.test(normalized) || !userId)
+        return;
+    await getPool().query(
+        `INSERT INTO shopkeeper_phones (phone, user_id, shop_app_id, created_at)
+         VALUES (?, ?, ?, UTC_TIMESTAMP(3))
+         ON DUPLICATE KEY UPDATE
+           user_id = VALUES(user_id),
+           shop_app_id = COALESCE(VALUES(shop_app_id), shop_app_id)`,
+        [normalized, String(userId), shopAppId ? String(shopAppId) : null],
+    );
+}
+
+/** Rebuild registry from active shopkeeper rows (migration / repair). */
+export async function rebuildShopkeeperPhoneRegistry() {
+    const p = getPool();
+    await p.query('DELETE FROM shopkeeper_phones');
+    await p.query(`
+      INSERT INTO shopkeeper_phones (phone, user_id, shop_app_id, created_at)
+      SELECT
+        RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) AS phone,
+        SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created_at ASC), ',', 1) AS user_id,
+        SUBSTRING_INDEX(GROUP_CONCAT(IFNULL(shop_app_id, '') ORDER BY created_at ASC), ',', 1) AS shop_app_id,
+        UTC_TIMESTAMP(3)
+      FROM users
+      WHERE role = 'shopkeeper'
+        AND IFNULL(status, 'active') <> 'deleted'
+        AND CHAR_LENGTH(RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10)) = 10
+      GROUP BY RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10)
+    `);
+    // Normalize empty shop_app_id to NULL
+    await p.query(`UPDATE shopkeeper_phones SET shop_app_id = NULL WHERE shop_app_id = ''`);
+}
+
+/**
+ * True if this mobile is (or was registered as) a shopkeeper/admin in any shop.
+ * Checks in-memory auth, durable registry, and users table.
+ */
+export async function isShopkeeperPhoneAnywhere(phone) {
+    const normalized = normalizePhone(phone);
+    if (!/^\d{10}$/.test(normalized))
+        return false;
+
+    try {
+        const authHit = loadAuth().accounts.some(
+            (a) => a.role === 'shopkeeper' && normalizePhone(a.phone) === normalized,
+        );
+        if (authHit)
+            return true;
+    }
+    catch {
+        // auth may not be loaded yet during early boot
+    }
+
+    const p = getPool();
+    const [reg] = await p.query(
+        `SELECT phone FROM shopkeeper_phones WHERE phone = ? LIMIT 1`,
+        [normalized],
+    );
+    if (reg.length > 0)
+        return true;
+
+    const [rows] = await p.query(
+        `SELECT id FROM users
+         WHERE role = 'shopkeeper'
+           AND IFNULL(status, 'active') <> 'deleted'
+           AND RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) = ?
+         LIMIT 1`,
+        [normalized],
+    );
+    if (rows.length > 0) {
+        // Keep registry warm for trigger protection
+        try {
+            await registerShopkeeperPhone(normalized, rows[0].id, null);
+        }
+        catch {
+            // ignore registry warm failures
+        }
+        return true;
+    }
+    return false;
 }
 
 /** All auth accounts for a phone (owner shops + customer memberships). */

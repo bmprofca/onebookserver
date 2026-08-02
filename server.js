@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createSession, publicAccount, requireAuth, requireShopkeeper, } from './src/auth.js';
 import { deleteAttachmentFile, ensureUploadsDir, saveAttachmentData, UPLOADS_DIR, } from './src/attachments.js';
-import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isLive, isSystemCashAccountId, isValidPhone, liveOnly, loadAuth, loadState, markDeleted, newId, newTxId, normalizePhone, phoneExistsInShop, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, toClientState, writeCustomerOpeningBalance, } from './src/store.js';
+import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, ensureCashAccounts, flushStore, generateDemoOtp, generateOtp, ensureShopkeeperDraft, getActionConfirmCode, getShopByAppId, initStore, isLive, isSystemCashAccountId, isValidPhone, liveOnly, loadAuth, loadState, markDeleted, newId, newTxId, normalizePhone, phoneExistsInShop, isShopkeeperPhoneAnywhere, SHOPKEEPER_AS_CUSTOMER_ERROR, profilesForPhone, uniqueTxCreatedAt, saveAuth, saveShopByAppId, saveState, toClientState, writeCustomerOpeningBalance, } from './src/store.js';
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
@@ -387,6 +387,10 @@ app.post('/api/public/join/:appId', async (req, res) => {
         return;
     }
     try {
+        if (await isShopkeeperPhoneAnywhere(phone)) {
+            res.status(409).json({ error: SHOPKEEPER_AS_CUSTOMER_ERROR });
+            return;
+        }
         if (await phoneExistsInShop(phone, shop.appId)) {
             res.status(409).json({ error: 'This mobile is already linked to this shop' });
             return;
@@ -424,8 +428,12 @@ app.post('/api/public/join/:appId', async (req, res) => {
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile is already linked to this shop' });
+        if (/Duplicate|ER_DUP_ENTRY|Shopkeeper phone cannot be added as customer/i.test(msg)) {
+            res.status(409).json({
+                error: /Shopkeeper phone/i.test(msg)
+                    ? SHOPKEEPER_AS_CUSTOMER_ERROR
+                    : 'This mobile is already linked to this shop',
+            });
             return;
         }
         console.error('[join] create failed', err);
@@ -1059,6 +1067,10 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
         return;
     }
     try {
+        if (role === 'customer' && phone && (await isShopkeeperPhoneAnywhere(phone))) {
+            res.status(409).json({ error: SHOPKEEPER_AS_CUSTOMER_ERROR });
+            return;
+        }
         if (phone && (await phoneExistsInShop(phone, state.appId))) {
             res.status(409).json({
                 error: 'This mobile number is already linked to this shop',
@@ -1107,8 +1119,12 @@ app.post('/api/users', requireShopkeeper, async (req, res) => {
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile number is already linked to this shop' });
+        if (/Duplicate|ER_DUP_ENTRY|Shopkeeper phone cannot be added as customer/i.test(msg)) {
+            res.status(409).json({
+                error: /Shopkeeper phone/i.test(msg)
+                    ? SHOPKEEPER_AS_CUSTOMER_ERROR
+                    : 'This mobile number is already linked to this shop',
+            });
             return;
         }
         console.error('[users] create failed', err);
@@ -1190,6 +1206,10 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
             return;
         }
         try {
+            if (await isShopkeeperPhoneAnywhere(phone)) {
+                res.status(409).json({ error: SHOPKEEPER_AS_CUSTOMER_ERROR });
+                return;
+            }
             if (await phoneExistsInShop(phone, state.appId, id)) {
                 res.status(409).json({ error: 'This mobile number is already used in this shop' });
                 return;
@@ -1261,8 +1281,12 @@ app.put('/api/users/:id', requireShopkeeper, async (req, res) => {
     }
     catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        if (/Duplicate|ER_DUP_ENTRY/i.test(msg)) {
-            res.status(409).json({ error: 'This mobile number is already used in this shop' });
+        if (/Duplicate|ER_DUP_ENTRY|Shopkeeper phone cannot be added as customer/i.test(msg)) {
+            res.status(409).json({
+                error: /Shopkeeper phone/i.test(msg)
+                    ? SHOPKEEPER_AS_CUSTOMER_ERROR
+                    : 'This mobile number is already used in this shop',
+            });
             return;
         }
         console.error('[users] update failed', err);
@@ -2653,6 +2677,8 @@ app.post('/api/todos/reminders/ack', requireShopkeeper, (req, res) => {
 });
 app.post('/api/todos/bulk-delete', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
+    if (!requireActionConfirmCode(req, res, state))
+        return;
     const ids = Array.isArray(req.body?.ids)
         ? req.body.ids.map((id) => String(id)).filter(Boolean)
         : [];
@@ -2677,6 +2703,8 @@ app.post('/api/todos/bulk-delete', requireShopkeeper, (req, res) => {
 });
 app.delete('/api/todos/:id', requireShopkeeper, (req, res) => {
     const state = loadState(req.account);
+    if (!requireActionConfirmCode(req, res, state))
+        return;
     const id = String(req.params.id);
     const index = (state.todos ?? []).findIndex((todo) => todo.id === id && isLive(todo));
     if (index < 0) {
@@ -3148,21 +3176,45 @@ app.delete('/api/reset', requireShopkeeper, (req, res) => {
     if (!requireActionConfirmCode(req, res, stateForCode))
         return;
     const account = req.account;
-    const state = emptyState();
-    // Keep same shop id if present so users stay linked
-    if (account.shopAppId)
-        state.appId = account.shopAppId;
-    state.users = [
-        {
-            id: account.id,
-            name: account.name,
-            phone: account.phone,
-            email: account.email ?? null,
-            role: 'shopkeeper',
-            createdAt: account.createdAt,
-        },
-    ];
+    const state = loadState(account);
+    const now = new Date().toISOString();
+    // Soft-delete only: keep every row in DB/cache with status=deleted for recovery.
+    state.transactions = (state.transactions ?? []).map((tx) =>
+        isLive(tx) ? markDeleted(tx) : tx,
+    );
+    state.recurringBillings = (state.recurringBillings ?? []).map((billing) =>
+        isLive(billing) ? { ...markDeleted(billing), active: false } : billing,
+    );
+    state.services = (state.services ?? []).map((service) =>
+        isLive(service) ? { ...markDeleted(service), updatedAt: now } : service,
+    );
+    state.todos = (state.todos ?? []).map((todo) =>
+        isLive(todo) ? markDeleted(todo) : todo,
+    );
+    state.cashAccounts = (state.cashAccounts ?? []).map((accountRow) => {
+        if (!isLive(accountRow))
+            return accountRow;
+        if (accountRow.isSystem || isSystemCashAccountId(accountRow.id))
+            return accountRow;
+        return markDeleted(accountRow);
+    });
+    state.users = (state.users ?? []).map((user) => {
+        if (!isLive(user))
+            return user;
+        if (user.id === account.id || user.role === 'shopkeeper')
+            return user;
+        const freedPhone = user.phone;
+        return {
+            ...markDeleted(user),
+            phoneOriginal: freedPhone || user.phoneOriginal || null,
+            phone: `z${String(user.id).replace(/-/g, '').slice(0, 14)}`,
+        };
+    });
     state.activeUserId = account.id;
+    state.openingBalance = 0;
+    const cash = state.cashAccounts.find((a) => a.isSystem || isSystemCashAccountId(a.id));
+    if (cash)
+        cash.openingBalance = 0;
     saveState(state, account);
     res.json({ state, totalReceipts: 0, totalPayments: 0, liveBalance: 0 });
 });

@@ -603,6 +603,65 @@ async function ensureSchema() {
         }
     }
 
+    // Durable registry: phones that own a business cannot be customers anywhere
+    await p.query(`
+    CREATE TABLE IF NOT EXISTS shopkeeper_phones (
+      phone CHAR(10) NOT NULL PRIMARY KEY,
+      user_id CHAR(36) NOT NULL,
+      shop_app_id VARCHAR(32) NULL,
+      created_at DATETIME(3) NOT NULL,
+      KEY idx_sk_phone_user (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+    try {
+        await p.query(`
+      INSERT IGNORE INTO shopkeeper_phones (phone, user_id, shop_app_id, created_at)
+      SELECT
+        RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10) AS phone,
+        SUBSTRING_INDEX(GROUP_CONCAT(id ORDER BY created_at ASC), ',', 1) AS user_id,
+        NULLIF(SUBSTRING_INDEX(GROUP_CONCAT(IFNULL(shop_app_id, '') ORDER BY created_at ASC), ',', 1), '') AS shop_app_id,
+        UTC_TIMESTAMP(3)
+      FROM users
+      WHERE role = 'shopkeeper'
+        AND IFNULL(status, 'active') <> 'deleted'
+        AND CHAR_LENGTH(RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10)) = 10
+      GROUP BY RIGHT(REGEXP_REPLACE(IFNULL(phone, ''), '[^0-9]', ''), 10)
+    `);
+        console.log('[MySQL] shopkeeper_phones registry synced');
+    }
+    catch (err) {
+        console.warn('[MySQL] shopkeeper_phones backfill skipped:', err instanceof Error ? err.message : err);
+    }
+
+    // DB-level guard: customer rows cannot use a shopkeeper phone (reads registry table)
+    for (const [name, event] of [
+        ['trg_users_block_sk_phone_customer_ins', 'INSERT'],
+        ['trg_users_block_sk_phone_customer_upd', 'UPDATE'],
+    ]) {
+        try {
+            await p.query(`DROP TRIGGER IF EXISTS ${name}`);
+            await p.query(`
+        CREATE TRIGGER ${name}
+        BEFORE ${event} ON users
+        FOR EACH ROW
+        BEGIN
+          IF NEW.role = 'customer' AND IFNULL(NEW.status, 'active') <> 'deleted' THEN
+            IF EXISTS (
+              SELECT 1 FROM shopkeeper_phones sp
+              WHERE sp.phone = RIGHT(REGEXP_REPLACE(IFNULL(NEW.phone, ''), '[^0-9]', ''), 10)
+            ) THEN
+              SIGNAL SQLSTATE '45000'
+                SET MESSAGE_TEXT = 'Shopkeeper phone cannot be added as customer';
+            END IF;
+          END IF;
+        END
+      `);
+        }
+        catch (err) {
+            console.warn(`[MySQL] ${name} skipped:`, err instanceof Error ? err.message : err);
+        }
+    }
+
     await p.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_message_logs (
       id CHAR(36) NOT NULL PRIMARY KEY,
