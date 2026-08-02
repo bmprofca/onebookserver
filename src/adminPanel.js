@@ -386,24 +386,29 @@ export function registerAdminPanelRoutes(app, deps) {
     const params = []
     let where = '1=1'
     if (q) {
-      where += ' AND (name LIKE ? OR phone LIKE ? OR id LIKE ? OR shop_app_id LIKE ?)'
+      where += ` AND (
+        u.name LIKE ? OR u.phone LIKE ? OR u.id LIKE ? OR u.shop_app_id LIKE ?
+        OR s.shop_name LIKE ?
+      )`
       const like = `%${q}%`
-      params.push(like, like, like, like)
+      params.push(like, like, like, like, like)
     }
     if (status && ['active', 'suspended', 'deleted'].includes(status)) {
-      where += " AND IFNULL(status, 'active') = ?"
+      where += " AND IFNULL(u.status, 'active') = ?"
       params.push(status)
     }
     if (role && ['shopkeeper', 'customer'].includes(role)) {
-      where += ' AND role = ?'
+      where += ' AND LOWER(u.role) = ?'
       params.push(role)
     }
     params.push(limit)
     const [rows] = await getPool().query(
-      `SELECT id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, status, deleted_at, created_at
-       FROM users
+      `SELECT u.id, u.name, u.phone, u.email, u.role, u.phone_verified, u.shop_app_id,
+              u.opening_balance, u.status, u.deleted_at, u.created_at
+       FROM users u
+       LEFT JOIN shops s ON s.app_id = u.shop_app_id
        WHERE ${where}
-       ORDER BY created_at DESC
+       ORDER BY u.created_at DESC
        LIMIT ?`,
       params,
     )
