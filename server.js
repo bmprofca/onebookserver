@@ -10,6 +10,11 @@ import { calcTotals, DEFAULT_CASH_ACCOUNT_ID, defaultCashAccount, emptyState, en
 import { consumeProfileTicket, issueProfileTicket, peekProfileTicket } from './src/profileTickets.js';
 import { isWhatsAppOtpConfigured, sendWhatsAppOtp, sendPaymentReminderWhatsApp, isPaymentReminderWhatsAppConfigured } from './src/onechatting.js';
 import { isSmsOtpConfigured, sendSmsOtp } from './src/fast2sms.js';
+import {
+    ensureAdminSchema,
+    recordLoginEvent,
+    registerAdminPanelRoutes,
+} from './src/adminPanel.js';
 import { indiaTodayDateInput, normalizeAutoBillTime } from './src/time.js';
 import { applyResumeSchedule, billingDateForPeriod, createRecurringBilling, daysAfterPeriodEnd, isBillingDateAllowed, isDateOnly, lastGeneratedBillDate, localDateString, materializeRecurringBillings, minResumeBillingDate, postNextRecurringBill, RECURRING_INTERVALS, } from './src/recurring.js';
 import { buildJoinPageHtml } from './src/joinPageHtml.js';
@@ -678,9 +683,22 @@ app.post('/api/auth/select-profile', (req, res) => {
         res.status(404).json({ error: 'Profile not found for this mobile' });
         return;
     }
+    const accountStatus = String(account.status || 'active').toLowerCase();
+    if (accountStatus === 'suspended' || accountStatus === 'deleted') {
+        res.status(403).json({ error: 'This account is suspended or removed. Contact support.' });
+        return;
+    }
     consumeProfileTicket(ticket);
     const token = createSession(account.id);
     const state = loadState(account);
+    void recordLoginEvent({
+        userId: account.id,
+        phone: account.phone,
+        role: account.role,
+        event: 'login',
+        ip: req.ip || req.headers['x-forwarded-for'] || null,
+        userAgent: req.get('user-agent') || null,
+    });
     res.json({
         token,
         account: publicAccount(account),
@@ -3230,9 +3248,12 @@ app.delete('/api/reset', requireShopkeeper, (req, res) => {
     saveState(state, account);
     res.json({ state, totalReceipts: 0, totalPayments: 0, liveBalance: 0 });
 });
+registerAdminPanelRoutes(app, { issueOtp, otpSentMessage });
+
 async function main() {
     try {
         await initStore();
+        await ensureAdminSchema();
     }
     catch (err) {
         const message = err instanceof Error ? err.message : String(err);

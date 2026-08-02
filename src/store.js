@@ -840,6 +840,8 @@ async function loadAuthFromDb() {
         shopAppId: r.shop_app_id == null ? null : String(r.shop_app_id),
         phoneVerified: Boolean(r.phone_verified),
         createdAt: fromMysqlDate(r.created_at),
+        status: String(r.status || 'active'),
+        deletedAt: r.deleted_at == null ? null : fromMysqlDate(r.deleted_at),
     }));
     const sessions = sessionRows.map((r) => ({
         token: String(r.token),

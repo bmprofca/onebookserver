@@ -5,13 +5,15 @@
 
 export const RECORD_STATUS = {
   ACTIVE: 'active',
+  SUSPENDED: 'suspended',
   DELETED: 'deleted',
 }
 
 export function normalizeRecordStatus(value) {
-  return String(value || '').trim().toLowerCase() === RECORD_STATUS.DELETED
-    ? RECORD_STATUS.DELETED
-    : RECORD_STATUS.ACTIVE
+  const status = String(value || '').trim().toLowerCase()
+  if (status === RECORD_STATUS.DELETED) return RECORD_STATUS.DELETED
+  if (status === RECORD_STATUS.SUSPENDED) return RECORD_STATUS.SUSPENDED
+  return RECORD_STATUS.ACTIVE
 }
 
 export function isLive(record) {
