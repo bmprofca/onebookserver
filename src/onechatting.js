@@ -650,19 +650,36 @@ export async function sendOneChattingTemplate({
   }
 }
 
-async function resolveTemplate(baseUrl, token, templateRef, categories) {
-  for (const category of categories) {
-    const templates = await listApprovedTemplates(baseUrl, token, category)
-    const match = templates.find(
-      (template) =>
-        template.template_id === templateRef ||
-        (template.template_name === templateRef && template.status === 'APPROVED'),
-    )
-    if (match?.template_id) return match
+async function resolveTemplate(baseUrl, token, templateRef, categories, options = {}) {
+  const ref = String(templateRef || '').trim()
+  if (!ref) throw new Error('WhatsApp template id is required')
+
+  // OTP / known ids: skip slow template-list (User Tokens often cannot list; listing can exceed client timeouts).
+  if (options.assumeId) {
+    return { template_id: ref, template_name: ref, status: 'APPROVED' }
   }
-  throw new Error(
-    `Approved WhatsApp template "${templateRef}" was not found in OneChatting (${categories.join(', ')})`,
-  )
+
+  try {
+    for (const category of categories) {
+      const templates = await listApprovedTemplates(baseUrl, token, category)
+      const match = templates.find(
+        (template) =>
+          template.template_id === ref ||
+          (template.template_name === ref && template.status === 'APPROVED'),
+      )
+      if (match?.template_id) return match
+    }
+  } catch (err) {
+    console.warn(
+      `[OneChatting] template list failed for "${ref}"; sending with configured id:`,
+      err instanceof Error ? err.message : err,
+    )
+    return { template_id: ref, template_name: ref, status: 'APPROVED' }
+  }
+
+  // Not found in list — still attempt send; Meta may accept the configured template_id.
+  console.warn(`[OneChatting] template "${ref}" not in approved list; sending with configured id`)
+  return { template_id: ref, template_name: ref, status: 'APPROVED' }
 }
 
 function headerImageFromTemplate(templateRow) {
@@ -702,7 +719,9 @@ async function sendTemplateMessage(phone10, templateRef, bodyTexts, categories, 
   const url = `${baseUrl}/developer/message/send-template`
 
   try {
-    const templateRow = await resolveTemplate(baseUrl, token, templateRef, categories)
+    const templateRow = await resolveTemplate(baseUrl, token, templateRef, categories, {
+      assumeId: Boolean(options.assumeId),
+    })
     const templateId = templateRow.template_id
     const headerMediaUrl =
       options.headerImageUrl ||
@@ -817,7 +836,9 @@ export async function sendWhatsAppOtp(phone10, otpCode) {
   }
   return sendTemplateMessage(phone10, templateRef, [otpCode], ['AUTHENTICATION'], {
     retries: 1,
-    timeoutMs: 12000,
+    timeoutMs: 10000,
+    // Never list templates for OTP — listing is slow and often blocked for User Tokens.
+    assumeId: true,
   })
 }
 

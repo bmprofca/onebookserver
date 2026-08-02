@@ -175,10 +175,19 @@ async function issueOtp(phone, purpose) {
     if (channels.length > 0) {
         const sent = [];
         const errors = [];
-        // Send in parallel so WhatsApp + SMS arrive together.
+        // Cap each provider so a hung WhatsApp/SMS call cannot exceed the app client timeout.
+        const channelTimeoutMs = Math.max(8000, Math.min(20000, Number(process.env.OTP_CHANNEL_TIMEOUT_MS || 14000)));
+        const withChannelTimeout = (label, promise) => Promise.race([
+            promise,
+            new Promise((resolve) => {
+                setTimeout(() => {
+                    resolve({ ok: false, error: `${label} timed out after ${Math.round(channelTimeoutMs / 1000)}s` });
+                }, channelTimeoutMs);
+            }),
+        ]);
         const jobs = [];
         if (channels.includes('whatsapp')) {
-            jobs.push(sendWhatsAppOtp(phone, code).then((result) => {
+            jobs.push(withChannelTimeout('WhatsApp', sendWhatsAppOtp(phone, code)).then((result) => {
                 if (result.ok)
                     sent.push('whatsapp');
                 else
@@ -186,14 +195,14 @@ async function issueOtp(phone, purpose) {
             }));
         }
         if (channels.includes('sms')) {
-            jobs.push(sendSmsOtp(phone, code, { purpose }).then((result) => {
+            jobs.push(withChannelTimeout('SMS', sendSmsOtp(phone, code, { purpose })).then((result) => {
                 if (result.ok)
                     sent.push('sms');
                 else
                     errors.push(`SMS: ${result.error}`);
             }));
         }
-        await Promise.all(jobs);
+        await Promise.allSettled(jobs);
         const missing = channels.filter((c) => !sent.includes(c));
         if (sent.length === 0) {
             return {
@@ -204,9 +213,7 @@ async function issueOtp(phone, purpose) {
         }
         // Prefer both channels, but do not block login/register if one provider is down.
         if (requireBoth && missing.length > 0) {
-            console.warn(
-                `[OTP ${purpose}] ${phone} partial delivery — missing ${missing.join(' and ')} (${errors.join('; ') || 'unknown'})`,
-            );
+            console.warn(`[OTP ${purpose}] ${phone} partial delivery — missing ${missing.join(' and ')} (${errors.join('; ') || 'unknown'})`);
         }
         const channel = toDeliveryChannel(sent);
         console.log(`[OTP ${purpose}] ${phone} → ${channel}`);
