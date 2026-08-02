@@ -716,4 +716,235 @@ export function registerAdminPanelRoutes(app, deps) {
       })),
     })
   })
+
+  /** List shops / businesses with owner, customer & transaction counts. */
+  app.get('/api/admin/businesses', requireAdminAuth, async (req, res) => {
+    const q = String(req.query.q || '').trim()
+    const limit = Math.min(Math.max(Number(req.query.limit) || 100, 1), 500)
+    const params = []
+    let where = '1=1'
+    if (q) {
+      where += ` AND (
+        s.shop_name LIKE ? OR s.app_id LIKE ? OR s.shop_address LIKE ?
+        OR u.name LIKE ? OR u.phone LIKE ?
+      )`
+      const like = `%${q}%`
+      params.push(like, like, like, like, like)
+    }
+    params.push(limit)
+    const [rows] = await getPool().query(
+      `SELECT
+         s.app_id, s.shop_name, s.shop_address, s.opening_balance, s.setup_complete, s.created_at,
+         u.id AS owner_id, u.name AS owner_name, u.phone AS owner_phone, u.status AS owner_status,
+         (SELECT COUNT(*) FROM users c
+           WHERE c.shop_app_id = s.app_id AND c.role = 'customer'
+             AND IFNULL(c.status,'active') <> 'deleted') AS customer_count,
+         (SELECT COUNT(*) FROM transactions t WHERE t.shop_app_id = s.app_id) AS transaction_count,
+         (SELECT COUNT(*) FROM whatsapp_message_logs m WHERE m.shop_app_id = s.app_id) AS message_count,
+         (SELECT COALESCE(SUM(CASE WHEN t.type = 'receipt' THEN ABS(t.amount) ELSE 0 END), 0)
+            FROM transactions t WHERE t.shop_app_id = s.app_id) AS total_receipts,
+         (SELECT COALESCE(SUM(CASE WHEN t.type = 'payment' THEN ABS(t.amount) ELSE 0 END), 0)
+            FROM transactions t WHERE t.shop_app_id = s.app_id) AS total_payments
+       FROM shops s
+       LEFT JOIN users u
+         ON u.id = COALESCE(
+           s.owner_user_id,
+           (SELECT id FROM users sk
+             WHERE sk.shop_app_id = s.app_id AND sk.role = 'shopkeeper'
+             ORDER BY sk.created_at ASC LIMIT 1)
+         )
+       WHERE ${where}
+       ORDER BY s.created_at DESC
+       LIMIT ?`,
+      params,
+    )
+    res.json({
+      businesses: rows.map((r) => {
+        const opening = Number(r.opening_balance) || 0
+        const totalReceipts = Number(r.total_receipts) || 0
+        const totalPayments = Number(r.total_payments) || 0
+        return {
+          appId: String(r.app_id),
+          shopName: String(r.shop_name ?? ''),
+          shopAddress: String(r.shop_address ?? ''),
+          setupComplete: Boolean(r.setup_complete),
+          openingBalance: opening,
+          liveBalance: opening + totalPayments - totalReceipts,
+          totalReceipts,
+          totalPayments,
+          customerCount: Number(r.customer_count) || 0,
+          transactionCount: Number(r.transaction_count) || 0,
+          messageCount: Number(r.message_count) || 0,
+          owner: r.owner_id
+            ? {
+                id: String(r.owner_id),
+                name: String(r.owner_name ?? ''),
+                phone: String(r.owner_phone ?? ''),
+                status: String(r.owner_status || 'active'),
+              }
+            : null,
+          createdAt:
+            r.created_at instanceof Date
+              ? r.created_at.toISOString()
+              : new Date(r.created_at).toISOString(),
+        }
+      }),
+    })
+  })
+
+  /** Business profile: customers, transaction history, messaging history. */
+  app.get('/api/admin/businesses/:appId', requireAdminAuth, async (req, res) => {
+    const appId = String(req.params.appId || '').trim()
+    if (!appId) {
+      res.status(400).json({ error: 'Shop app id is required' })
+      return
+    }
+    const p = getPool()
+    const [shopRows] = await p.query(
+      `SELECT app_id, shop_name, shop_address, opening_balance, setup_complete, owner_user_id, created_at
+       FROM shops WHERE app_id = ? LIMIT 1`,
+      [appId],
+    )
+    if (!shopRows[0]) {
+      res.status(404).json({ error: 'Business not found' })
+      return
+    }
+    const shop = shopRows[0]
+    const [ownerRows] = await p.query(
+      `SELECT id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, status, deleted_at, created_at
+       FROM users
+       WHERE (id = ? OR (shop_app_id = ? AND role = 'shopkeeper'))
+       ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, created_at ASC
+       LIMIT 1`,
+      [shop.owner_user_id, appId, shop.owner_user_id],
+    )
+    const owner = ownerRows[0] ? mapUserRow(ownerRows[0]) : null
+
+    const [customerRows] = await p.query(
+      `SELECT id, name, phone, email, role, phone_verified, shop_app_id, opening_balance, status, deleted_at, created_at
+       FROM users
+       WHERE shop_app_id = ? AND role = 'customer'
+       ORDER BY created_at DESC
+       LIMIT 500`,
+      [appId],
+    )
+
+    const [txRows] = await p.query(
+      `SELECT id, type, category, amount, remarks,
+              recorded_by_user_id, recorded_by_name,
+              customer_user_id, customer_name, customer_phone,
+              cash_account_name, created_at
+       FROM transactions
+       WHERE shop_app_id = ?
+       ORDER BY created_at DESC
+       LIMIT 300`,
+      [appId],
+    )
+
+    const [msgRows] = await p.query(
+      `SELECT id, shop_app_id, customer_user_id, customer_name, phone,
+              kind, template_name, message_body, status, error_message,
+              cost_inr, sent_by_name, created_at
+       FROM whatsapp_message_logs
+       WHERE shop_app_id = ?
+       ORDER BY created_at DESC
+       LIMIT 200`,
+      [appId],
+    )
+
+    const [[txAgg]] = await p.query(
+      `SELECT
+         COUNT(*) AS transaction_count,
+         COALESCE(SUM(CASE WHEN type = 'receipt' THEN ABS(amount) ELSE 0 END), 0) AS total_receipts,
+         COALESCE(SUM(CASE WHEN type = 'payment' THEN ABS(amount) ELSE 0 END), 0) AS total_payments
+       FROM transactions WHERE shop_app_id = ?`,
+      [appId],
+    )
+
+    const openingBalance = Number(shop.opening_balance) || 0
+    const totalReceipts = Number(txAgg.total_receipts) || 0
+    const totalPayments = Number(txAgg.total_payments) || 0
+
+    // Per-customer receipt/payment totals from recent history + full SQL agg
+    const [custAgg] = await p.query(
+      `SELECT customer_user_id,
+              COALESCE(SUM(CASE WHEN type = 'receipt' THEN ABS(amount) ELSE 0 END), 0) AS receipts,
+              COALESCE(SUM(CASE WHEN type = 'payment' THEN ABS(amount) ELSE 0 END), 0) AS payments
+       FROM transactions
+       WHERE shop_app_id = ? AND customer_user_id IS NOT NULL
+       GROUP BY customer_user_id`,
+      [appId],
+    )
+    const custTotals = new Map(
+      custAgg.map((r) => [
+        String(r.customer_user_id),
+        { receipts: Number(r.receipts) || 0, payments: Number(r.payments) || 0 },
+      ]),
+    )
+
+    res.json({
+      business: {
+        appId: String(shop.app_id),
+        shopName: String(shop.shop_name ?? ''),
+        shopAddress: String(shop.shop_address ?? ''),
+        setupComplete: Boolean(shop.setup_complete),
+        openingBalance,
+        liveBalance: openingBalance + totalPayments - totalReceipts,
+        totalReceipts,
+        totalPayments,
+        transactionCount: Number(txAgg.transaction_count) || 0,
+        customerCount: customerRows.length,
+        messageCount: msgRows.length,
+        owner,
+        createdAt:
+          shop.created_at instanceof Date
+            ? shop.created_at.toISOString()
+            : new Date(shop.created_at).toISOString(),
+      },
+      customers: customerRows.map((r) => {
+        const user = mapUserRow(r)
+        const t = custTotals.get(user.id) || { receipts: 0, payments: 0 }
+        return {
+          ...user,
+          totalReceipts: t.receipts,
+          totalPayments: t.payments,
+          liveBalance: user.openingBalance + t.payments - t.receipts,
+        }
+      }),
+      transactions: txRows.map((t) => ({
+        id: String(t.id),
+        type: String(t.type),
+        category: String(t.category || ''),
+        amount: Number(t.amount) || 0,
+        remarks: String(t.remarks ?? ''),
+        recordedByName: String(t.recorded_by_name ?? ''),
+        customerId: t.customer_user_id == null ? null : String(t.customer_user_id),
+        customerName: t.customer_name == null ? null : String(t.customer_name),
+        customerPhone: t.customer_phone == null ? null : String(t.customer_phone),
+        cashAccountName: t.cash_account_name == null ? null : String(t.cash_account_name),
+        createdAt:
+          t.created_at instanceof Date
+            ? t.created_at.toISOString()
+            : new Date(t.created_at).toISOString(),
+      })),
+      messages: msgRows.map((row) => ({
+        id: String(row.id),
+        shopAppId: String(row.shop_app_id),
+        customerId: row.customer_user_id == null ? null : String(row.customer_user_id),
+        customerName: String(row.customer_name ?? ''),
+        phone: String(row.phone ?? ''),
+        kind: String(row.kind ?? ''),
+        templateName: String(row.template_name ?? ''),
+        messageBody: String(row.message_body ?? ''),
+        status: String(row.status ?? ''),
+        error: row.error_message == null ? null : String(row.error_message),
+        costInr: Number(row.cost_inr) || 0,
+        sentByName: row.sent_by_name == null ? null : String(row.sent_by_name),
+        createdAt:
+          row.created_at instanceof Date
+            ? row.created_at.toISOString()
+            : new Date(row.created_at).toISOString(),
+      })),
+    })
+  })
 }
